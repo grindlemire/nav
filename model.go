@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -8,10 +9,25 @@ import (
 	"runtime"
 	"strings"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/sahilm/fuzzy"
 )
 
 var fileSeparator = string(filepath.Separator)
+
+// searchIndexBatchMsg delivers a batch of discovered nodes
+type searchIndexBatchMsg struct {
+	nodes      []*treeNode
+	done       bool  // true when DFS traversal is complete
+	generation int64 // generation counter to detect stale messages
+}
+
+// fuzzySearchResultMsg delivers fuzzy search results from background worker
+type fuzzySearchResultMsg struct {
+	query      string        // Query this result is for (detect stale)
+	matches    []fuzzy.Match // Raw fuzzy matches with scores
+	generation int64         // generation counter to detect stale messages
+}
 
 type model struct {
 	path      string
@@ -63,6 +79,22 @@ type model struct {
 	treeSearchStartNode *treeNode
 	// searchMatchNodes stores the actual fuzzy match results (not ancestors) for returning on Enter
 	searchMatchNodes []*treeNode
+
+	// Search index streaming fields
+	searchIndexNodes     []*treeNode      // Accumulated nodes for fuzzy matching
+	searchIndexNames     []string         // Cached names (parallel to searchIndexNodes)
+	searchIndexLoading   bool             // True while background loader is running
+	searchIndexChan      chan []*treeNode // Channel for receiving batches from goroutine
+	searchIndexCancel    func()           // Cancel function to stop the background goroutine
+	searchIndexRoot      *treeNode        // Root node being indexed (for reuse detection)
+	searchPendingMatches []fuzzy.Match    // Accumulated matches during indexing (for incremental matching)
+
+	// Background fuzzy search worker fields
+	searchQueryChan        chan string               // Send queries to background worker
+	searchResultChan       chan fuzzySearchResultMsg // Receive results
+	searchWorkerCancel     func()                    // Cancel the worker goroutine
+	searchIndexGeneration  int64                     // Generation counter for index loader (to detect stale messages)
+	searchWorkerGeneration int64                     // Generation counter for search worker (to detect stale messages)
 
 	// gPressed tracks whether 'g' was pressed for the 'gg' command to jump to top
 	gPressed bool
@@ -207,6 +239,318 @@ func (m *model) clearSearch() {
 	m.search = ""
 	m.treeSearchStartNode = nil
 	m.searchMatchNodes = nil
+	m.searchPendingMatches = nil
+	m.stopSearchWorker()
+	// Note: searchIndexNodes/Names are kept for reuse
+}
+
+// stopSearchIndexLoader cancels the background indexing goroutine and cleans up
+func (m *model) stopSearchIndexLoader() {
+	if m.searchIndexCancel != nil {
+		m.searchIndexCancel()
+		m.searchIndexCancel = nil
+	}
+	if m.searchIndexChan != nil {
+		// Drain channel to prevent goroutine leak
+		ch := m.searchIndexChan
+		m.searchIndexChan = nil
+		go func() {
+			for range ch {
+			}
+		}()
+	}
+	m.searchIndexLoading = false
+}
+
+// startSearchIndexLoader starts background indexing of the tree root
+func (m *model) startSearchIndexLoader(root *treeNode) tea.Cmd {
+	// Stop any existing loader
+	m.stopSearchIndexLoader()
+
+	if root == nil {
+		m.searchIndexLoading = false
+		return nil
+	}
+
+	m.searchIndexLoading = true
+	m.searchIndexRoot = root
+	m.searchIndexNodes = nil
+	m.searchIndexNames = nil
+	m.searchPendingMatches = nil // Clear pending matches when starting new index
+	m.searchIndexGeneration++    // Increment generation to invalidate old messages
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m.searchIndexCancel = cancel
+	m.searchIndexChan = make(chan []*treeNode, 10)
+
+	go func() {
+		defer close(m.searchIndexChan)
+		streamDFS(ctx, root, m.modeHidden, m.searchIndexChan)
+	}()
+
+	return m.pollSearchIndexCmd()
+}
+
+// pollSearchIndexCmd returns a command that reads the next batch from the channel
+func (m *model) pollSearchIndexCmd() tea.Cmd {
+	// Capture current generation to detect stale messages
+	gen := m.searchIndexGeneration
+	ch := m.searchIndexChan
+	return func() tea.Msg {
+		if ch == nil {
+			return searchIndexBatchMsg{done: true, generation: gen}
+		}
+		batch, ok := <-ch
+		if !ok {
+			return searchIndexBatchMsg{done: true, generation: gen}
+		}
+		return searchIndexBatchMsg{nodes: batch, done: false, generation: gen}
+	}
+}
+
+// indexingCmd returns the polling command if indexing is active, otherwise nil.
+// Use this in action handlers that may trigger indexing to ensure polling starts.
+func (m *model) indexingCmd() tea.Cmd {
+	if m.searchIndexLoading && m.searchIndexChan != nil {
+		return m.pollSearchIndexCmd()
+	}
+	return nil
+}
+
+// stopSearchWorker cancels the background fuzzy search worker and cleans up
+func (m *model) stopSearchWorker() {
+	if m.searchWorkerCancel != nil {
+		m.searchWorkerCancel()
+		m.searchWorkerCancel = nil
+	}
+	if m.searchQueryChan != nil {
+		// Capture and drain channel to prevent goroutine leak
+		ch := m.searchQueryChan
+		m.searchQueryChan = nil
+		go func() {
+			for range ch {
+			}
+		}()
+	}
+	if m.searchResultChan != nil {
+		// Capture and drain channel to prevent goroutine leak
+		ch := m.searchResultChan
+		m.searchResultChan = nil
+		go func() {
+			for range ch {
+			}
+		}()
+	}
+}
+
+// startSearchWorker starts a background goroutine that processes search queries
+func (m *model) startSearchWorker() tea.Cmd {
+	// Stop any existing worker
+	m.stopSearchWorker()
+
+	if !m.modeTree {
+		return nil
+	}
+
+	m.searchWorkerGeneration++ // Increment generation to invalidate old messages
+	gen := m.searchWorkerGeneration
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m.searchWorkerCancel = cancel
+	m.searchQueryChan = make(chan string, 1)
+	m.searchResultChan = make(chan fuzzySearchResultMsg, 1)
+
+	go func() {
+		defer close(m.searchResultChan)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case query, ok := <-m.searchQueryChan:
+				if !ok {
+					return
+				}
+				// Snapshot the current index length and slice for safe concurrent access
+				// We capture the length first, then the slice up to that length
+				indexLen := len(m.searchIndexNames)
+				if indexLen == 0 {
+					// Send empty result
+					select {
+					case <-ctx.Done():
+						return
+					case m.searchResultChan <- fuzzySearchResultMsg{query: query, matches: nil, generation: gen}:
+					}
+					continue
+				}
+
+				// Create a snapshot of names up to current length
+				indexNames := make([]string, indexLen)
+				copy(indexNames, m.searchIndexNames[:indexLen])
+
+				// Run fuzzy search in background
+				matches := fuzzy.Find(query, indexNames)
+
+				// Send result (non-blocking)
+				select {
+				case <-ctx.Done():
+					return
+				case m.searchResultChan <- fuzzySearchResultMsg{query: query, matches: matches, generation: gen}:
+				}
+			}
+		}
+	}()
+
+	return m.pollSearchResultCmd()
+}
+
+// pollSearchResultCmd returns a command that reads the next result from the channel
+func (m *model) pollSearchResultCmd() tea.Cmd {
+	// Capture current generation and channel to detect stale messages
+	gen := m.searchWorkerGeneration
+	ch := m.searchResultChan
+	return func() tea.Msg {
+		if ch == nil {
+			return fuzzySearchResultMsg{query: "", matches: nil, generation: gen}
+		}
+		result, ok := <-ch
+		if !ok {
+			return fuzzySearchResultMsg{query: "", matches: nil, generation: gen}
+		}
+		return result
+	}
+}
+
+// mergeMatchesByScore merges two sorted match slices maintaining score order
+func mergeMatchesByScore(a, b []fuzzy.Match) []fuzzy.Match {
+	result := make([]fuzzy.Match, 0, len(a)+len(b))
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		if a[i].Score >= b[j].Score {
+			result = append(result, a[i])
+			i++
+		} else {
+			result = append(result, b[j])
+			j++
+		}
+	}
+	result = append(result, a[i:]...)
+	result = append(result, b[j:]...)
+	return result
+}
+
+// rebuildVisibleNodesFromMatches builds visible nodes from fuzzy match results
+func (m *model) rebuildVisibleNodesFromMatches(fuzzyMatches []fuzzy.Match) {
+	if len(fuzzyMatches) == 0 {
+		m.visibleNodes = nil
+		m.displayed = 0
+		m.searchMatchNodes = nil
+		if m.treeIdx >= len(m.visibleNodes) {
+			m.treeIdx = max(0, len(m.visibleNodes)-1)
+		}
+		return
+	}
+
+	// Determine search root
+	searchRoot := m.treeSearchStartNode
+	if searchRoot == nil {
+		searchRoot = m.treeRoot
+	}
+
+	// Filter matches to only include nodes under the search root
+	// This is needed because the index may contain nodes from parent directories
+	searchRootPrefix := searchRoot.fullPath + string(filepath.Separator)
+	matchingNodes := make([]*treeNode, 0, len(fuzzyMatches))
+	for _, match := range fuzzyMatches {
+		if match.Index < len(m.searchIndexNodes) {
+			node := m.searchIndexNodes[match.Index]
+			// Only include if node is under search root (or is the search root itself)
+			if node.fullPath == searchRoot.fullPath ||
+				strings.HasPrefix(node.fullPath, searchRootPrefix) {
+				matchingNodes = append(matchingNodes, node)
+			}
+		}
+	}
+
+	m.searchMatchNodes = matchingNodes
+
+	m.visibleNodes = buildFilteredTree(searchRoot, matchingNodes, m.modeHidden)
+	m.displayed = len(m.visibleNodes)
+
+	if m.treeIdx >= len(m.visibleNodes) {
+		m.treeIdx = max(0, len(m.visibleNodes)-1)
+	}
+}
+
+// rebuildVisibleNodesFromIndex filters visible nodes using the cached search index
+func (m *model) rebuildVisibleNodesFromIndex() {
+	if len(m.searchIndexNodes) == 0 || m.search == "" {
+		m.visibleNodes = nil
+		m.displayed = 0
+		if m.treeIdx >= len(m.visibleNodes) {
+			m.treeIdx = max(0, len(m.visibleNodes)-1)
+		}
+		return
+	}
+
+	// Run fuzzy matching on accumulated index
+	fuzzyMatches := fuzzy.Find(m.search, m.searchIndexNames)
+	m.rebuildVisibleNodesFromMatches(fuzzyMatches)
+}
+
+// formatAbbreviatedCount formats a count as abbreviated (e.g., 5132 -> "5K")
+func formatAbbreviatedCount(count int) string {
+	if count < 1000 {
+		return fmt.Sprintf("%d", count)
+	}
+	if count < 1000000 {
+		return fmt.Sprintf("%dK", count/1000)
+	}
+	return fmt.Sprintf("%dM", count/1000000)
+}
+
+// handleRootChange handles root directory changes by reusing index where possible
+func (m *model) handleRootChange(newRoot *treeNode) tea.Cmd {
+	if newRoot == nil {
+		return nil
+	}
+
+	oldRoot := m.searchIndexRoot
+	if oldRoot == nil {
+		// No previous index, start fresh
+		return m.startSearchIndexLoader(newRoot)
+	}
+
+	// Check if new root is descendant of old root (navigated DOWN)
+	if strings.HasPrefix(newRoot.fullPath+string(filepath.Separator), oldRoot.fullPath+string(filepath.Separator)) {
+		// Filter existing index to nodes under new root
+		filteredNodes := make([]*treeNode, 0)
+		filteredNames := make([]string, 0)
+		newRootPrefix := newRoot.fullPath + string(filepath.Separator)
+
+		for i, node := range m.searchIndexNodes {
+			if node.fullPath == newRoot.fullPath || strings.HasPrefix(node.fullPath+string(filepath.Separator), newRootPrefix) {
+				filteredNodes = append(filteredNodes, node)
+				filteredNames = append(filteredNames, m.searchIndexNames[i])
+			}
+		}
+
+		m.searchIndexNodes = filteredNodes
+		m.searchIndexNames = filteredNames
+		m.searchIndexRoot = newRoot
+		m.searchPendingMatches = nil // Clear pending matches when filtering index
+		// No need to restart indexing - we have what we need
+		return nil
+	}
+
+	// Check if old root is descendant of new root (navigated UP)
+	if strings.HasPrefix(oldRoot.fullPath+string(filepath.Separator), newRoot.fullPath+string(filepath.Separator)) {
+		// Keep existing nodes (they're still valid), but need to index new siblings
+		// For simplicity, restart indexing from new root (reuse will happen naturally)
+		return m.startSearchIndexLoader(newRoot)
+	}
+
+	// Completely different directory - start fresh
+	return m.startSearchIndexLoader(newRoot)
 }
 
 func index(c int, r int, rows int) int {
@@ -214,17 +558,18 @@ func index(c int, r int, rows int) int {
 }
 
 // listTree builds tree structure from current path
-func (m *model) listTree() error {
+// Returns error and a command to start background indexing
+func (m *model) listTree() (error, tea.Cmd) {
 	files, err := os.ReadDir(m.path)
 	if err != nil {
-		return err
+		return err, nil
 	}
 
 	entries := make([]*entry, 0, len(files))
 	for _, f := range files {
 		ent, err := newEntry(f)
 		if err != nil {
-			return err
+			return err, nil
 		}
 		entries = append(entries, ent)
 	}
@@ -244,7 +589,10 @@ func (m *model) listTree() error {
 	}
 
 	m.rebuildVisibleNodes()
-	return nil
+
+	// Start background indexing of the tree root
+	// This will be used for fast search when search mode is entered
+	return nil, m.startSearchIndexLoader(m.treeRoot)
 }
 
 // rebuildVisibleNodes flattens expanded tree into visible nodes list
@@ -269,6 +617,7 @@ func (m *model) rebuildVisibleNodes() {
 }
 
 // rebuildVisibleNodesWithSearch filters visible nodes by fuzzy search query
+// Uses the cached search index if available, otherwise falls back to collecting nodes on-demand
 func (m *model) rebuildVisibleNodesWithSearch() {
 	m.visibleNodes = nil
 	if m.treeRoot == nil || m.search == "" {
@@ -279,26 +628,34 @@ func (m *model) rebuildVisibleNodesWithSearch() {
 		return
 	}
 
-	// Use search start node if set, otherwise default to root
+	// Use cached index if available (preferred - faster)
+	if len(m.searchIndexNodes) > 0 {
+		m.rebuildVisibleNodesFromIndex()
+		return
+	}
+
+	// Fallback: collect nodes on-demand (for backward compatibility or if indexing hasn't started)
 	searchRoot := m.treeSearchStartNode
 	if searchRoot == nil {
 		searchRoot = m.treeRoot
 	}
 
-	// Note: Tree loading is now done when entering search mode (in actions.go)
-	// to avoid blocking I/O on every keystroke. The tree structure is pre-loaded
-	// once and reused for all subsequent search queries.
-
-	// Collect all nodes from search root into flat list
 	allNodes := make([]*treeNode, 0)
+	if searchRoot == nil {
+		m.displayed = 0
+		m.treeIdx = 0
+		return
+	}
 	if searchRoot == m.treeRoot {
-		// If searching from root, collect all root children's descendants
-		for _, child := range searchRoot.children {
-			descendants := child.collectAllDescendants(m.modeHidden)
-			allNodes = append(allNodes, descendants...)
+		if searchRoot.children != nil {
+			for _, child := range searchRoot.children {
+				if child != nil {
+					descendants := child.collectAllDescendants(m.modeHidden)
+					allNodes = append(allNodes, descendants...)
+				}
+			}
 		}
 	} else {
-		// If searching from a subtree, collect that subtree
 		descendants := searchRoot.collectAllDescendants(m.modeHidden)
 		allNodes = append(allNodes, descendants...)
 	}
@@ -309,7 +666,6 @@ func (m *model) rebuildVisibleNodesWithSearch() {
 		return
 	}
 
-	// 3. Extract node names for fuzzy matching
 	nodeNames := make([]string, len(allNodes))
 	for i, node := range allNodes {
 		if node.entry != nil {
@@ -319,7 +675,6 @@ func (m *model) rebuildVisibleNodesWithSearch() {
 		}
 	}
 
-	// 4. Run fuzzy.Find to get matches
 	fuzzyMatches := fuzzy.Find(m.search, nodeNames)
 	if len(fuzzyMatches) == 0 {
 		m.displayed = 0
@@ -327,7 +682,6 @@ func (m *model) rebuildVisibleNodesWithSearch() {
 		return
 	}
 
-	// 5. Get matching nodes from fuzzy results
 	matchingNodes := make([]*treeNode, 0, len(fuzzyMatches))
 	for _, match := range fuzzyMatches {
 		if match.Index < len(allNodes) {
@@ -335,14 +689,10 @@ func (m *model) rebuildVisibleNodesWithSearch() {
 		}
 	}
 
-	// Store the actual matches for use when Enter is pressed
 	m.searchMatchNodes = matchingNodes
-
-	// 6. Build filtered tree showing only branches to matches
 	m.visibleNodes = buildFilteredTree(searchRoot, matchingNodes, m.modeHidden)
 	m.displayed = len(m.visibleNodes)
 
-	// Clamp cursor
 	if m.treeIdx >= len(m.visibleNodes) {
 		m.treeIdx = max(0, len(m.visibleNodes)-1)
 	}

@@ -421,6 +421,20 @@ func (m *model) treeLocationBar() string {
 		return m.treeSearchLocationBar()
 	}
 
+	// Show indexing status if indexing is in progress
+	// Only show if we actually have a channel (indexing started) and it's still loading
+	if m.searchIndexLoading && m.searchIndexChan != nil {
+		path := m.path
+		if node := m.selectedTreeNode(); node != nil {
+			path = node.fullPath
+		}
+		path = substituteHomeDir(path)
+		breadcrumb := barRendererBreadcrumb.Render(path)
+		count := formatAbbreviatedCount(len(m.searchIndexNodes))
+		breadcrumb += barRendererSearchCount.Render(fmt.Sprintf(" (indexing %s files...)", count))
+		return barRendererLocation.Render(breadcrumb)
+	}
+
 	// Get the selected node's full path for breadcrumb, fallback to m.path
 	path := m.path
 	if node := m.selectedTreeNode(); node != nil {
@@ -502,8 +516,12 @@ func (m *model) treeSearchLocationBar() string {
 	breadcrumb += barRendererBreadcrumbSeparator.Render(" - ")
 	breadcrumb += barRendererSearch.Render(m.search)
 
-	// Count matched files (non-directory leaves only)
-	if m.search != "" && len(m.searchMatchNodes) > 0 {
+	// Show indexing status if still loading
+	if m.searchIndexLoading {
+		count := formatAbbreviatedCount(len(m.searchIndexNodes))
+		breadcrumb += barRendererSearchCount.Render(fmt.Sprintf(" (indexing %s files...)", count))
+	} else if m.search != "" && len(m.searchMatchNodes) > 0 {
+		// Count matched files (non-directory leaves only)
 		matchedFiles := 0
 		for _, node := range m.searchMatchNodes {
 			if node.entry != nil && !node.entry.hasMode(entryModeDir) {

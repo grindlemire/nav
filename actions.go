@@ -7,11 +7,16 @@ import (
 
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/sahilm/fuzzy"
 
 	"github.com/dkaslovsky/nav/internal/sanitize"
 )
 
 func (m *model) Init() tea.Cmd {
+	// If indexing is already active (e.g., started via -t flag), return polling command
+	if m.searchIndexLoading && m.searchIndexChan != nil {
+		return m.pollSearchIndexCmd()
+	}
 	return nil
 }
 
@@ -38,6 +43,71 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	esc := false
 
 	switch msg := msg.(type) {
+
+	case fuzzySearchResultMsg:
+		// Ignore stale results from old workers
+		if msg.generation != m.searchWorkerGeneration {
+			return m, nil // Don't continue polling - wrong generation
+		}
+		// Ignore stale results where query changed
+		if msg.query != m.search {
+			return m, m.pollSearchResultCmd()
+		}
+		// Build tree on main thread (fast relative to fuzzy)
+		m.rebuildVisibleNodesFromMatches(msg.matches)
+		return m, m.pollSearchResultCmd()
+
+	case searchIndexBatchMsg:
+		// Ignore stale batches from old indexers
+		if msg.generation != m.searchIndexGeneration {
+			return m, nil // Don't continue polling - wrong generation
+		}
+
+		// Capture index length before appending (for incremental matching)
+		startIdx := len(m.searchIndexNodes)
+
+		// Append new nodes to index
+		for _, node := range msg.nodes {
+			m.searchIndexNodes = append(m.searchIndexNodes, node)
+			if node.entry != nil {
+				m.searchIndexNames = append(m.searchIndexNames, node.entry.Name())
+			} else {
+				m.searchIndexNames = append(m.searchIndexNames, "")
+			}
+		}
+
+		// Incremental fuzzy matching: only search new nodes, then merge results
+		if m.search != "" && len(msg.nodes) > 0 {
+			// Only fuzzy search the NEW names
+			newNames := m.searchIndexNames[startIdx:]
+			newMatches := fuzzy.Find(m.search, newNames)
+
+			// Adjust indices to be absolute (add startIdx offset)
+			for i := range newMatches {
+				newMatches[i].Index += startIdx
+			}
+
+			// Merge into pending matches (maintain score order)
+			m.searchPendingMatches = mergeMatchesByScore(m.searchPendingMatches, newMatches)
+
+			// Rebuild tree from merged matches
+			m.rebuildVisibleNodesFromMatches(m.searchPendingMatches)
+		}
+
+		// Continue polling if not done
+		if !msg.done {
+			return m, m.pollSearchIndexCmd()
+		}
+		// Indexing complete - clear loading state and channel reference
+		m.searchIndexLoading = false
+		m.searchIndexChan = nil
+		// Clear pending matches since indexing is done
+		m.searchPendingMatches = nil
+		// If we're in search mode and worker isn't running, start it now that we have an index
+		if m.modeSearch && m.modeTree && m.searchQueryChan == nil && len(m.searchIndexNodes) > 0 {
+			return m, m.startSearchWorker()
+		}
+		return m, nil
 
 	case tea.WindowSizeMsg:
 		if result := actionWindowResize(m, msg, esc); !result.noop {
@@ -96,6 +166,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	m.saveCursor()
+
+	// Auto-start polling if indexing is active but no command is running
+	if m.searchIndexLoading && m.searchIndexChan != nil {
+		return m, m.pollSearchIndexCmd()
+	}
+
 	return m, nil
 }
 
@@ -163,7 +239,9 @@ func actionModeSearch(m *model, msg tea.KeyMsg, esc bool) actionResult {
 			}
 			m.treeSearchStartNode = nil
 			m.searchMatchNodes = nil
-			m.search = "" // Clear search to unfilter
+			m.search = ""                // Clear search to unfilter
+			m.searchPendingMatches = nil // Clear pending matches
+			m.stopSearchWorker()         // Stop background worker
 			m.rebuildVisibleNodes()
 			// Find and position cursor on the saved node
 			if savedPath != "" {
@@ -189,28 +267,20 @@ func actionModeSearch(m *model, msg tea.KeyMsg, esc bool) actionResult {
 		if len(m.search) > 0 {
 			m.search = m.search[:len(m.search)-1]
 			if m.modeTree {
+				// Dispatch to background worker if active, otherwise rebuild synchronously
+				if m.searchQueryChan != nil {
+					select {
+					case m.searchQueryChan <- m.search:
+					default:
+					}
+					return newActionResult(m.pollSearchResultCmd())
+				}
 				m.rebuildVisibleNodes()
 			}
 			return newActionResult(nil)
 		}
 
-		m.saveCursor()
-
-		_, m.search = filepath.Split(m.path)
-		path, err := filepath.Abs(filepath.Join(m.path, ".."))
-		if err != nil {
-			m.setError(err, "failed to evaluate path")
-			return newActionResult(nil)
-		}
-		m.setPath(path)
-
-		err = m.list()
-		if err != nil {
-			m.restorePath()
-			m.setError(err, err.Error())
-			return newActionResult(nil)
-		}
-
+		// Empty search - do nothing (don't navigate up directory)
 		return newActionResult(nil)
 
 	case key.Matches(msg, keySelect):
@@ -220,6 +290,8 @@ func actionModeSearch(m *model, msg tea.KeyMsg, esc bool) actionResult {
 			m.modeSearch = false
 			// Keep m.search set to maintain filtered view
 			// Keep m.treeSearchStartNode to maintain search scope
+			m.searchPendingMatches = nil // Clear pending matches
+			m.stopSearchWorker()         // Stop background worker
 			m.rebuildVisibleNodes()
 			// Set cursor to first item in filtered view
 			m.treeIdx = 0
@@ -254,6 +326,14 @@ func actionModeSearch(m *model, msg tea.KeyMsg, esc bool) actionResult {
 		// (On Unix, keyFileSeparator handles this, but this case handles it on other systems)
 		m.search += "/"
 		if m.modeTree {
+			// Dispatch to background worker if active, otherwise rebuild synchronously
+			if m.searchQueryChan != nil {
+				select {
+				case m.searchQueryChan <- m.search:
+				default:
+				}
+				return newActionResult(m.pollSearchResultCmd())
+			}
 			m.rebuildVisibleNodes()
 		}
 		return newActionResult(nil)
@@ -262,6 +342,14 @@ func actionModeSearch(m *model, msg tea.KeyMsg, esc bool) actionResult {
 		if msg.Type == tea.KeyRunes || key.Matches(msg, keySpace) {
 			m.search += string(msg.Runes)
 			if m.modeTree {
+				// Dispatch to background worker if active, otherwise rebuild synchronously
+				if m.searchQueryChan != nil {
+					select {
+					case m.searchQueryChan <- m.search:
+					default:
+					}
+					return newActionResult(m.pollSearchResultCmd())
+				}
 				m.rebuildVisibleNodes()
 			}
 			return newActionResult(nil)
@@ -278,7 +366,8 @@ func actionModeMarks(m *model, msg tea.KeyMsg, esc bool) actionResult {
 		if err != nil {
 			m.setError(err, "failed to update marks")
 		}
-		return newActionResult(nil)
+		// Continue polling if in tree mode with active indexing
+		return newActionResult(m.indexingCmd())
 	}
 
 	return newActionResultNoop()
@@ -294,7 +383,7 @@ func actionModeTree(m *model, msg tea.KeyMsg, esc bool) actionResult {
 
 	case key.Matches(msg, keyGotoBottom):
 		m.treeMoveToBottom()
-		return newActionResult(nil)
+		return newActionResult(m.indexingCmd())
 
 	case key.Matches(msg, keyGotoTop):
 		if m.gPressed {
@@ -305,7 +394,7 @@ func actionModeTree(m *model, msg tea.KeyMsg, esc bool) actionResult {
 			// First 'g' press - wait for second
 			m.gPressed = true
 		}
-		return newActionResult(nil)
+		return newActionResult(m.indexingCmd())
 
 	case key.Matches(msg, keyModeSearch), key.Matches(msg, keySearchSlash):
 		// Enter search mode - save parent of current node as search start
@@ -320,46 +409,54 @@ func actionModeTree(m *model, msg tea.KeyMsg, esc bool) actionResult {
 				// No parent (at root level), use root
 				m.treeSearchStartNode = m.treeRoot
 			}
-			// Pre-load all descendants ONCE when entering search mode
-			// This avoids blocking I/O on every keystroke
-			if m.treeSearchStartNode != nil {
-				if m.treeSearchStartNode.entry != nil && m.treeSearchStartNode.entry.hasMode(entryModeDir) {
-					_ = m.treeSearchStartNode.loadAllDescendants() // Ignore errors for unreadable dirs
-				}
-				// Also load all root children if searching from root
-				if m.treeSearchStartNode == m.treeRoot {
-					for _, child := range m.treeSearchStartNode.children {
-						if child.entry != nil && child.entry.hasMode(entryModeDir) {
-							_ = child.loadAllDescendants() // Ignore errors for unreadable dirs
-						}
+			// Start background search worker if we have an index
+			var cmd tea.Cmd
+			if len(m.searchIndexNodes) > 0 {
+				cmd = m.startSearchWorker()
+				// If there's already a search query, trigger search immediately
+				if m.search != "" {
+					select {
+					case m.searchQueryChan <- m.search:
+					default:
+					}
+					if cmd == nil {
+						cmd = m.pollSearchResultCmd()
 					}
 				}
+			} else {
+				// No index yet, use fallback search
+				if m.search != "" {
+					m.rebuildVisibleNodesWithSearch()
+				}
 			}
-			return newActionResult(nil)
+			return newActionResult(cmd)
 		}
 		// If already in search mode, "/" should be handled by search handler
 		return newActionResultNoop()
 
 	case key.Matches(msg, keyUp):
 		m.treeMoveUp()
-		return newActionResult(nil)
+		return newActionResult(m.indexingCmd())
 
 	case key.Matches(msg, keyDown):
 		m.treeMoveDown()
-		return newActionResult(nil)
+		return newActionResult(m.indexingCmd())
 
 	case key.Matches(msg, keyLeft):
 		m.treeCollapse()
-		return newActionResult(nil)
+		// treeCollapse may navigate to parent dir which restarts indexing
+		return newActionResult(m.indexingCmd())
 
 	case key.Matches(msg, keyRight):
 		cmd := m.treeExpand()
-		return newActionResult(cmd)
+		// Ensure polling continues even if treeExpand returns nil
+		return newActionResult(tea.Batch(cmd, m.indexingCmd()))
 
 	case key.Matches(msg, keyToggleExpand):
 		if !m.modeSearch {
 			cmd := m.treeToggleExpand()
-			return newActionResult(cmd)
+			// Ensure polling continues even if treeToggleExpand returns nil
+			return newActionResult(tea.Batch(cmd, m.indexingCmd()))
 		}
 
 	case key.Matches(msg, keySelect):
@@ -369,7 +466,7 @@ func actionModeTree(m *model, msg tea.KeyMsg, esc bool) actionResult {
 	case key.Matches(msg, keyMark):
 		if !m.modeSearch {
 			m.toggleTreeMark()
-			return newActionResult(nil)
+			return newActionResult(m.indexingCmd())
 		}
 
 	case key.Matches(msg, keyBack):
@@ -388,7 +485,7 @@ func (m *model) treeSelectAction() actionResult {
 	// If in normal mode with filtered view, return all fuzzy match results
 	if !m.modeSearch && m.search != "" {
 		if len(m.searchMatchNodes) == 0 {
-			return newActionResult(nil)
+			return newActionResult(m.indexingCmd())
 		}
 		var paths []string
 		for _, node := range m.searchMatchNodes {
@@ -416,12 +513,12 @@ func (m *model) treeSelectAction() actionResult {
 			m.clearSearch()
 			return newActionResult(tea.Sequence(tea.ClearScreen, tea.Quit))
 		}
-		return newActionResult(nil)
+		return newActionResult(m.indexingCmd())
 	}
 
 	node := m.selectedTreeNode()
 	if node == nil || node.entry == nil {
-		return newActionResult(nil)
+		return newActionResult(m.indexingCmd())
 	}
 
 	m.saveCursor()
@@ -451,7 +548,7 @@ func (m *model) treeSelectAction() actionResult {
 		sl, err := followSymlink(m.path, node.entry)
 		if err != nil {
 			m.setError(err, "failed to evaluate symlink")
-			return newActionResult(nil)
+			return newActionResult(m.indexingCmd())
 		}
 		if !sl.info.IsDir() {
 			// The symlink points to a file.
@@ -475,7 +572,7 @@ func (m *model) treeSelectAction() actionResult {
 		errors.New("selection is not a file, directory, or symlink"),
 		"unexpected file type",
 	)
-	return newActionResult(nil)
+	return newActionResult(m.indexingCmd())
 }
 
 func actionModeGeneral(m *model, msg tea.KeyMsg, esc bool) actionResult {
@@ -484,7 +581,7 @@ func actionModeGeneral(m *model, msg tea.KeyMsg, esc bool) actionResult {
 	// Normal mode escape
 	case esc || key.Matches(msg, keyEsc):
 		m.clearSearch()
-		return newActionResult(nil)
+		return newActionResult(m.indexingCmd())
 
 	// Return
 
@@ -507,7 +604,7 @@ func actionModeGeneral(m *model, msg tea.KeyMsg, esc bool) actionResult {
 			selected, err := m.selected()
 			if err != nil {
 				m.setError(err, "failed to select entry")
-				return newActionResult(nil)
+				return newActionResult(m.indexingCmd())
 			}
 			selecteds = append(selecteds, selected)
 		}
@@ -518,7 +615,7 @@ func actionModeGeneral(m *model, msg tea.KeyMsg, esc bool) actionResult {
 				sl, err := followSymlink(m.path, selected)
 				if err != nil {
 					m.setError(err, "failed to evaluate symlink")
-					return newActionResult(nil)
+					return newActionResult(m.indexingCmd())
 				}
 				path = sanitize.SanitizeOutputPath(sl.absPath)
 			} else {
@@ -607,6 +704,10 @@ func actionModeGeneral(m *model, msg tea.KeyMsg, esc bool) actionResult {
 	case key.Matches(msg, keyModeSearch):
 		m.modeSearch = true
 		m.clearMarks()
+		// If in tree mode with index, start search worker
+		if m.modeTree && len(m.searchIndexNodes) > 0 {
+			return newActionResult(m.startSearchWorker())
+		}
 
 	// Toggles
 
@@ -617,6 +718,7 @@ func actionModeGeneral(m *model, msg tea.KeyMsg, esc bool) actionResult {
 		m.modeHidden = !m.modeHidden
 		if m.modeTree {
 			m.rebuildVisibleNodes()
+			return newActionResult(m.indexingCmd())
 		}
 
 	case key.Matches(msg, keyToggleList):
@@ -626,15 +728,24 @@ func actionModeGeneral(m *model, msg tea.KeyMsg, esc bool) actionResult {
 		m.modeTree = !m.modeTree
 		if m.modeTree {
 			// Initialize tree mode
-			if err := m.listTree(); err != nil {
+			err, cmd := m.listTree()
+			if err != nil {
 				m.setError(err, "failed to initialize tree view")
 				m.modeTree = false
+				return newActionResult(nil)
 			} else {
 				m.treeIdx = 0
 				m.scrollOffset = 0
+				return newActionResult(cmd)
 			}
 		} else {
-			// Switch back to normal mode
+			// Switch back to normal mode - stop indexing and clear cache
+			m.stopSearchIndexLoader()
+			m.stopSearchWorker() // Stop search worker
+			m.searchIndexNodes = nil
+			m.searchIndexNames = nil
+			m.searchIndexRoot = nil
+			m.searchPendingMatches = nil
 			if err := m.list(); err != nil {
 				m.setError(err, "failed to switch to normal view")
 				m.modeTree = true

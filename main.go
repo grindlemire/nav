@@ -54,7 +54,7 @@ func main() {
 
 	// Populate the model.
 	if m.modeTree {
-		err = m.listTree()
+		err, _ = m.listTree()
 		if err != nil {
 			exit(err, m.exitCode)
 		}

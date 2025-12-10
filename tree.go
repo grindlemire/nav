@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 )
+
+const searchBatchSize = 500 // Nodes per batch
 
 type treeNode struct {
 	entry    *entry
@@ -116,12 +119,20 @@ func (n *treeNode) loadAllDescendants() error {
 
 // collectAllDescendants collects all descendants into a flat list regardless of expanded state
 func (n *treeNode) collectAllDescendants(modeHidden bool) []*treeNode {
+	if n == nil {
+		return nil
+	}
 	var nodes []*treeNode
 	n.collectAllDescendantsInto(&nodes, modeHidden)
 	return nodes
 }
 
 func (n *treeNode) collectAllDescendantsInto(nodes *[]*treeNode, modeHidden bool) {
+	// Skip nil nodes
+	if n == nil {
+		return
+	}
+
 	// Skip hidden unless mode is on
 	if n.entry != nil && !modeHidden && n.entry.hasMode(entryModeHidden) {
 		return
@@ -136,8 +147,12 @@ func (n *treeNode) collectAllDescendantsInto(nodes *[]*treeNode, modeHidden bool
 		if !n.loaded {
 			_ = n.loadChildren() // Ignore errors
 		}
-		for _, child := range n.children {
-			child.collectAllDescendantsInto(nodes, modeHidden)
+		if n.children != nil {
+			for _, child := range n.children {
+				if child != nil {
+					child.collectAllDescendantsInto(nodes, modeHidden)
+				}
+			}
 		}
 	}
 }
@@ -214,5 +229,75 @@ func buildFilteredTreeFlatten(node *treeNode, includeSet map[*treeNode]bool, mod
 		if includeSet[child] {
 			buildFilteredTreeFlatten(child, includeSet, modeHidden, result)
 		}
+	}
+}
+
+// streamDFS performs DFS traversal and sends batches of nodes to the channel.
+// It checks ctx.Done() periodically to allow cancellation.
+func streamDFS(ctx context.Context, root *treeNode, modeHidden bool, ch chan<- []*treeNode) {
+	if root == nil {
+		return
+	}
+
+	var batch []*treeNode
+	stack := []*treeNode{root}
+
+	for len(stack) > 0 {
+		// Check for cancellation
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		// Pop from stack
+		node := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
+		// Skip nil nodes
+		if node == nil {
+			continue
+		}
+
+		// Skip hidden if needed
+		if node.entry != nil && !modeHidden && node.entry.hasMode(entryModeHidden) {
+			continue
+		}
+
+		// Load children if directory
+		if node.entry != nil && node.entry.hasMode(entryModeDir) && !node.loaded {
+			_ = node.loadChildren() // Ignore errors
+		}
+
+		// Add to batch (skip virtual root)
+		if node.entry != nil {
+			batch = append(batch, node)
+		}
+
+		// Push children onto stack (reverse order for correct DFS)
+		if node.children != nil {
+			for i := len(node.children) - 1; i >= 0; i-- {
+				if node.children[i] != nil {
+					stack = append(stack, node.children[i])
+				}
+			}
+		}
+
+		// Send batch when full
+		if len(batch) >= searchBatchSize {
+			select {
+			case <-ctx.Done():
+				return
+			case ch <- batch:
+				batch = nil // Reset batch
+			}
+		}
+	}
+
+	// Send final batch (even if empty, to ensure completion is signaled)
+	select {
+	case <-ctx.Done():
+		return
+	case ch <- batch:
 	}
 }

@@ -161,10 +161,14 @@ func (m *model) treeCollapse() {
 
 			m.saveCursor()
 			m.setPath(parentPath)
-			if err := m.listTree(); err != nil {
+			err, _ := m.listTree()
+			if err != nil {
 				m.restorePath()
 				m.setError(err, err.Error())
 			} else {
+				// Handle root change - restart indexing from new root
+				// Command will be handled via batch messages in Update()
+				_ = m.handleRootChange(m.treeRoot)
 				// Clear search state and position cursor on the directory we came from
 				m.modeSearch = false
 				m.search = ""
@@ -219,10 +223,14 @@ func (m *model) treeCollapse() {
 		// Save the name of the directory we're leaving to position cursor on it after going up
 		_, childDirName := filepath.Split(m.path)
 		m.setPath(parentPath)
-		if err := m.listTree(); err != nil {
+		err, _ := m.listTree()
+		if err != nil {
 			m.restorePath()
 			m.setError(err, err.Error())
 		} else {
+			// Handle root change - restart indexing from new root
+			// Command will be handled via batch messages in Update()
+			_ = m.handleRootChange(m.treeRoot)
 			// Find the child directory we came from and position cursor on it
 			m.treeIdx = 0
 			m.scrollOffset = 0
