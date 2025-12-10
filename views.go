@@ -57,7 +57,7 @@ func (m *model) treeView() string {
 		}
 
 		var finalLine string
-		if i == m.treeIdx {
+		if i == m.treeIdx && !m.modeSearch {
 			if m.markedTreeNode(i) {
 				finalLine = cursorRendererSelectedMarked.Render(paddedLine)
 			} else {
@@ -416,6 +416,11 @@ func (m *model) treeLocationBar() string {
 		return barRendererError.Render(err + "\t\t")
 	}
 
+	// In search mode, show parent context + search query instead of full path breadcrumb
+	if m.modeSearch || m.search != "" {
+		return m.treeSearchLocationBar()
+	}
+
 	// Get the selected node's full path for breadcrumb, fallback to m.path
 	path := m.path
 	if node := m.selectedTreeNode(); node != nil {
@@ -476,14 +481,51 @@ func (m *model) treeLocationBar() string {
 
 	breadcrumb := strings.Join(breadcrumbParts, "")
 
-	// Append search term if in search mode
-	if m.modeSearch || m.search != "" {
-		if m.path != fileSeparator {
-			breadcrumb += barRendererSearch.Render("/" + m.search)
+	// Render with location bar background
+	return barRendererLocation.Render(breadcrumb)
+}
+
+// treeSearchLocationBar renders the location bar during tree search mode
+// Shows: parent - search_query (X matched files)
+func (m *model) treeSearchLocationBar() string {
+	// Get the parent directory name being searched
+	parentName := ""
+	if m.treeSearchStartNode != nil {
+		if m.treeSearchStartNode == m.treeRoot {
+			// Searching from root - use the base path name
+			parentName = m.path
+			if userHomeDir, err := os.UserHomeDir(); err == nil && strings.HasPrefix(parentName, userHomeDir) {
+				parentName = strings.Replace(parentName, userHomeDir, "~", 1)
+			}
+		} else if m.treeSearchStartNode.entry != nil {
+			parentName = m.treeSearchStartNode.fullPath
+			if userHomeDir, err := os.UserHomeDir(); err == nil && strings.HasPrefix(parentName, userHomeDir) {
+				parentName = strings.Replace(parentName, userHomeDir, "~", 1)
+			}
+		}
+	}
+	if parentName == "" {
+		parentName = m.path
+	}
+
+	// Build the location bar: parent - search_query
+	breadcrumb := barRendererBreadcrumb.Render(parentName)
+	breadcrumb += barRendererBreadcrumbSeparator.Render(" - ")
+	breadcrumb += barRendererSearch.Render(m.search)
+
+	// Count matched files (non-directory leaves only)
+	if m.search != "" && len(m.searchMatchNodes) > 0 {
+		matchedFiles := 0
+		for _, node := range m.searchMatchNodes {
+			if node.entry != nil && !node.entry.hasMode(entryModeDir) {
+				matchedFiles++
+			}
+		}
+		if matchedFiles > 0 {
+			breadcrumb += barRendererSearchCount.Render(fmt.Sprintf(" (%d matched files)", matchedFiles))
 		}
 	}
 
-	// Render with location bar background
 	return barRendererLocation.Render(breadcrumb)
 }
 

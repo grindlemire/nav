@@ -2,7 +2,6 @@ package main
 
 import (
 	"errors"
-	"fmt"
 	"path/filepath"
 	"strings"
 
@@ -19,10 +18,7 @@ func (m *model) Init() tea.Cmd {
 func (m *model) View() string {
 	var view string
 	if m.modeExit {
-		if m.modeSubshell || m.exitStr == "" {
-			return ""
-		}
-		return m.exitStr + "\n"
+		return ""
 	}
 	if m.modeHelp {
 		view = commands()
@@ -166,6 +162,7 @@ func actionModeSearch(m *model, msg tea.KeyMsg, esc bool) actionResult {
 				savedPath = selectedNode.fullPath
 			}
 			m.treeSearchStartNode = nil
+			m.searchMatchNodes = nil
 			m.search = "" // Clear search to unfilter
 			m.rebuildVisibleNodes()
 			// Find and position cursor on the saved node
@@ -217,45 +214,17 @@ func actionModeSearch(m *model, msg tea.KeyMsg, esc bool) actionResult {
 		return newActionResult(nil)
 
 	case key.Matches(msg, keySelect):
-		// In tree mode, Enter returns all leaf nodes that match the search
+		// In tree mode, Enter exits search mode but keeps filtered view
 		if m.modeTree {
-			leafNodes := m.findLeafNodes()
-			if len(leafNodes) > 0 {
-				var paths []string
-				for _, node := range leafNodes {
-					if node.entry == nil {
-						continue
-					}
-					var path string
-					if node.entry.hasMode(entryModeSymlink) {
-						// Use parent directory for symlink resolution
-						parentPath := filepath.Dir(node.fullPath)
-						sl, err := followSymlink(parentPath, node.entry)
-						if err != nil {
-							// Skip symlinks that can't be resolved
-							continue
-						}
-						path = sanitize.SanitizeOutputPath(sl.absPath)
-					} else {
-						path = sanitize.SanitizeOutputPath(node.fullPath)
-					}
-					paths = append(paths, path)
-				}
-				if len(paths) > 0 {
-					// Output one path per line
-					m.setExit(strings.Join(paths, "\n"))
-					if m.modeSubshell {
-						fmt.Print(m.exitStr)
-					}
-					m.clearSearch()
-					return newActionResult(tea.Quit)
-				}
-			}
-			// No leaf nodes found, just exit search
+			// Exit search mode but keep the filter
 			m.modeSearch = false
-			m.treeSearchStartNode = nil
-			m.search = ""
+			// Keep m.search set to maintain filtered view
+			// Keep m.treeSearchStartNode to maintain search scope
 			m.rebuildVisibleNodes()
+			// Set cursor to first item in filtered view
+			m.treeIdx = 0
+			m.scrollOffset = 0
+			m.adjustScrollOffset()
 			return newActionResult(nil)
 		}
 		_, cmd := m.searchSelectAction()
@@ -316,7 +285,27 @@ func actionModeMarks(m *model, msg tea.KeyMsg, esc bool) actionResult {
 }
 
 func actionModeTree(m *model, msg tea.KeyMsg, esc bool) actionResult {
+	// Reset gPressed if any key other than 'g' is pressed
+	if !key.Matches(msg, keyGotoTop) {
+		m.gPressed = false
+	}
+
 	switch {
+
+	case key.Matches(msg, keyGotoBottom):
+		m.treeMoveToBottom()
+		return newActionResult(nil)
+
+	case key.Matches(msg, keyGotoTop):
+		if m.gPressed {
+			// Second 'g' press - jump to top
+			m.treeMoveToTop()
+			m.gPressed = false
+		} else {
+			// First 'g' press - wait for second
+			m.gPressed = true
+		}
+		return newActionResult(nil)
 
 	case key.Matches(msg, keyModeSearch), key.Matches(msg, keySearchSlash):
 		// Enter search mode - save parent of current node as search start
@@ -352,6 +341,12 @@ func actionModeTree(m *model, msg tea.KeyMsg, esc bool) actionResult {
 		cmd := m.treeExpand()
 		return newActionResult(cmd)
 
+	case key.Matches(msg, keyToggleExpand):
+		if !m.modeSearch {
+			cmd := m.treeToggleExpand()
+			return newActionResult(cmd)
+		}
+
 	case key.Matches(msg, keySelect):
 		result := m.treeSelectAction()
 		return result
@@ -375,6 +370,40 @@ func actionModeTree(m *model, msg tea.KeyMsg, esc bool) actionResult {
 }
 
 func (m *model) treeSelectAction() actionResult {
+	// If in normal mode with filtered view, return all fuzzy match results
+	if !m.modeSearch && m.search != "" {
+		if len(m.searchMatchNodes) == 0 {
+			return newActionResult(nil)
+		}
+		var paths []string
+		for _, node := range m.searchMatchNodes {
+			if node.entry == nil {
+				continue
+			}
+			var path string
+			if node.entry.hasMode(entryModeSymlink) {
+				// Use parent directory for symlink resolution
+				parentPath := filepath.Dir(node.fullPath)
+				sl, err := followSymlink(parentPath, node.entry)
+				if err != nil {
+					// Skip symlinks that can't be resolved
+					continue
+				}
+				path = sanitize.SanitizeOutputPath(sl.absPath)
+			} else {
+				path = sanitize.SanitizeOutputPath(node.fullPath)
+			}
+			paths = append(paths, path)
+		}
+		if len(paths) > 0 {
+			// Output one path per line
+			m.setExit(strings.Join(paths, "\n"))
+			m.clearSearch()
+			return newActionResult(tea.Sequence(tea.ClearScreen, tea.Quit))
+		}
+		return newActionResult(nil)
+	}
+
 	node := m.selectedTreeNode()
 	if node == nil || node.entry == nil {
 		return newActionResult(nil)
@@ -385,8 +414,9 @@ func (m *model) treeSelectAction() actionResult {
 	// For files: return path and quit
 	if node.entry.hasMode(entryModeFile) {
 		m.setExit(sanitize.SanitizeOutputPath(node.fullPath))
-		if m.modeSubshell {
-			fmt.Print(m.exitStr)
+		// Clear screen if exiting from search
+		if m.search != "" {
+			return newActionResult(tea.Sequence(tea.ClearScreen, tea.Quit))
 		}
 		return newActionResult(tea.Quit)
 	}
@@ -394,8 +424,9 @@ func (m *model) treeSelectAction() actionResult {
 	// For directories: return path and quit (same as files)
 	if node.entry.hasMode(entryModeDir) {
 		m.setExit(sanitize.SanitizeOutputPath(node.fullPath))
-		if m.modeSubshell {
-			fmt.Print(m.exitStr)
+		// Clear screen if exiting from search
+		if m.search != "" {
+			return newActionResult(tea.Sequence(tea.ClearScreen, tea.Quit))
 		}
 		return newActionResult(tea.Quit)
 	}
@@ -410,15 +441,17 @@ func (m *model) treeSelectAction() actionResult {
 		if !sl.info.IsDir() {
 			// The symlink points to a file.
 			m.setExit(sanitize.SanitizeOutputPath(sl.absPath))
-			if m.modeSubshell {
-				fmt.Print(m.exitStr)
+			// Clear screen if exiting from search
+			if m.search != "" {
+				return newActionResult(tea.Sequence(tea.ClearScreen, tea.Quit))
 			}
 			return newActionResult(tea.Quit)
 		}
 		// The symlink points to a directory: return path and quit
 		m.setExit(sanitize.SanitizeOutputPath(sl.absPath))
-		if m.modeSubshell {
-			fmt.Print(m.exitStr)
+		// Clear screen if exiting from search
+		if m.search != "" {
+			return newActionResult(tea.Sequence(tea.ClearScreen, tea.Quit))
 		}
 		return newActionResult(tea.Quit)
 	}
@@ -442,9 +475,6 @@ func actionModeGeneral(m *model, msg tea.KeyMsg, esc bool) actionResult {
 
 	case key.Matches(msg, keyReturnDirectory):
 		m.setExit(sanitize.SanitizeOutputPath(m.path))
-		if m.modeSubshell {
-			fmt.Print(m.exitStr)
-		}
 		return newActionResult(tea.Quit)
 
 	case key.Matches(msg, keyReturnSelected):
@@ -483,9 +513,6 @@ func actionModeGeneral(m *model, msg tea.KeyMsg, esc bool) actionResult {
 		}
 
 		m.setExit(strings.Join(paths, " "))
-		if m.modeSubshell {
-			fmt.Print(m.exitStr)
-		}
 		return newActionResult(tea.Quit)
 
 	// Cursor

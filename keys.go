@@ -27,6 +27,9 @@ var (
 	keyLeft  = key.NewBinding(key.WithKeys("left", "h"))
 	keyRight = key.NewBinding(key.WithKeys("right", "l"))
 
+	keyGotoBottom = key.NewBinding(key.WithKeys("G"))
+	keyGotoTop    = key.NewBinding(key.WithKeys("g"))
+
 	keyModeHelp    = key.NewBinding(key.WithKeys("H"))
 	keyModeSearch  = key.NewBinding(key.WithKeys("i"))
 	keySearchSlash = key.NewBinding(key.WithKeys("/"))
@@ -35,6 +38,7 @@ var (
 	keyToggleHidden        = key.NewBinding(key.WithKeys("a"))
 	keyToggleList          = key.NewBinding(key.WithKeys("L"))
 	keyToggleTree          = key.NewBinding(key.WithKeys("t"))
+	keyToggleExpand        = key.NewBinding(key.WithKeys("m"))
 
 	keyDismissError = key.NewBinding(key.WithKeys("e"))
 )

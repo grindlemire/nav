@@ -21,6 +21,7 @@ var (
 	barRendererBreadcrumbCurrent   = lipgloss.NewStyle().Bold(true).Background(lipgloss.Color("#499F1C")).Foreground(lipgloss.Color("#FFFFFF"))
 	barRendererBreadcrumbSeparator = lipgloss.NewStyle().Foreground(lipgloss.Color("#888888"))
 	barRendererScrollIndicator     = lipgloss.NewStyle().Foreground(lipgloss.Color("#666666")).Italic(true)
+	barRendererSearchCount         = lipgloss.NewStyle().Foreground(lipgloss.Color("#888888")).Italic(true)
 )
 
 type cursorRenderer struct {

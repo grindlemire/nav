@@ -2,7 +2,6 @@ package main
 
 import (
 	"errors"
-	"fmt"
 	"path/filepath"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -20,9 +19,6 @@ func (m *model) selectAction() (*model, tea.Cmd) {
 
 	if selected.hasMode(entryModeFile) {
 		m.setExit(sanitize.SanitizeOutputPath(filepath.Join(m.path, selected.Name())))
-		if m.modeSubshell {
-			fmt.Print(m.exitStr)
-		}
 		return m, tea.Quit
 	}
 	if selected.hasMode(entryModeSymlink) {
@@ -33,9 +29,6 @@ func (m *model) selectAction() (*model, tea.Cmd) {
 		}
 		// Return path for both files and directories
 		m.setExit(sanitize.SanitizeOutputPath(sl.absPath))
-		if m.modeSubshell {
-			fmt.Print(m.exitStr)
-		}
 		return m, tea.Quit
 	}
 	if selected.hasMode(entryModeDir) {
@@ -45,9 +38,6 @@ func (m *model) selectAction() (*model, tea.Cmd) {
 			return m, nil
 		}
 		m.setExit(sanitize.SanitizeOutputPath(path))
-		if m.modeSubshell {
-			fmt.Print(m.exitStr)
-		}
 		return m, tea.Quit
 	}
 
@@ -72,11 +62,8 @@ func (m *model) searchSelectAction() (*model, tea.Cmd) {
 
 		if node.entry.hasMode(entryModeFile) {
 			m.setExit(sanitize.SanitizeOutputPath(node.fullPath))
-			if m.modeSubshell {
-				fmt.Print(m.exitStr)
-			}
 			m.clearSearch()
-			return m, tea.Quit
+			return m, tea.Sequence(tea.ClearScreen, tea.Quit)
 		}
 
 		if node.entry.hasMode(entryModeSymlink) {
@@ -88,19 +75,13 @@ func (m *model) searchSelectAction() (*model, tea.Cmd) {
 			}
 			// Return path for both files and directories
 			m.setExit(sanitize.SanitizeOutputPath(sl.absPath))
-			if m.modeSubshell {
-				fmt.Print(m.exitStr)
-			}
 			m.clearSearch()
-			return m, tea.Quit
+			return m, tea.Sequence(tea.ClearScreen, tea.Quit)
 		}
 		if node.entry.hasMode(entryModeDir) {
 			m.setExit(sanitize.SanitizeOutputPath(node.fullPath))
-			if m.modeSubshell {
-				fmt.Print(m.exitStr)
-			}
 			m.clearSearch()
-			return m, tea.Quit
+			return m, tea.Sequence(tea.ClearScreen, tea.Quit)
 		}
 
 		m.setError(
@@ -120,10 +101,7 @@ func (m *model) searchSelectAction() (*model, tea.Cmd) {
 
 	if selected.hasMode(entryModeFile) {
 		m.setExit(sanitize.SanitizeOutputPath(filepath.Join(m.path, selected.Name())))
-		if m.modeSubshell {
-			fmt.Print(m.exitStr)
-		}
-		return m, tea.Quit
+		return m, tea.Sequence(tea.ClearScreen, tea.Quit)
 	}
 	if selected.hasMode(entryModeSymlink) {
 		sl, err := followSymlink(m.path, selected)
@@ -134,11 +112,8 @@ func (m *model) searchSelectAction() (*model, tea.Cmd) {
 		}
 		// Return path for both files and directories
 		m.setExit(sanitize.SanitizeOutputPath(sl.absPath))
-		if m.modeSubshell {
-			fmt.Print(m.exitStr)
-		}
 		m.clearSearch()
-		return m, tea.Quit
+		return m, tea.Sequence(tea.ClearScreen, tea.Quit)
 	}
 	if selected.hasMode(entryModeDir) {
 		path, err := filepath.Abs(filepath.Join(m.path, selected.Name()))
@@ -148,11 +123,8 @@ func (m *model) searchSelectAction() (*model, tea.Cmd) {
 			return m, nil
 		}
 		m.setExit(sanitize.SanitizeOutputPath(path))
-		if m.modeSubshell {
-			fmt.Print(m.exitStr)
-		}
 		m.clearSearch()
-		return m, tea.Quit
+		return m, tea.Sequence(tea.ClearScreen, tea.Quit)
 	}
 
 	m.setError(

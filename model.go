@@ -61,6 +61,11 @@ type model struct {
 	// treeSearchStartNode is the node at cursor position when search mode is entered.
 	// Search will be scoped to this node's subtree (or its parent's subtree if it's a file).
 	treeSearchStartNode *treeNode
+	// searchMatchNodes stores the actual fuzzy match results (not ancestors) for returning on Enter
+	searchMatchNodes []*treeNode
+
+	// gPressed tracks whether 'g' was pressed for the 'gg' command to jump to top
+	gPressed bool
 }
 
 func newModel() *model {
@@ -201,6 +206,7 @@ func (m *model) clearSearch() {
 	m.modeSearch = false
 	m.search = ""
 	m.treeSearchStartNode = nil
+	m.searchMatchNodes = nil
 }
 
 func index(c int, r int, rows int) int {
@@ -321,8 +327,14 @@ func (m *model) rebuildVisibleNodesWithSearch() {
 				matchingNodes = append(matchingNodes, allNodes[match.Index])
 			}
 		}
+		// Store the actual matches for use when Enter is pressed
+		m.searchMatchNodes = matchingNodes
 		// Build filtered tree showing only branches to matches
-		m.visibleNodes = buildFilteredTree(m.treeRoot, matchingNodes, m.modeHidden)
+		searchRoot := m.treeRoot
+		if m.treeSearchStartNode != nil {
+			searchRoot = m.treeSearchStartNode
+		}
+		m.visibleNodes = buildFilteredTree(searchRoot, matchingNodes, m.modeHidden)
 		m.displayed = len(m.visibleNodes)
 		// Clamp cursor
 		if m.treeIdx >= len(m.visibleNodes) {
@@ -396,8 +408,12 @@ func (m *model) rebuildVisibleNodesWithSearch() {
 		}
 	}
 
+	// Store the actual matches for use when Enter is pressed
+	m.searchMatchNodes = matchingNodes
+
 	// 6. Build filtered tree showing only branches to matches
-	m.visibleNodes = buildFilteredTree(m.treeRoot, matchingNodes, m.modeHidden)
+	// searchRoot is already set to searchStartNode (m.treeSearchStartNode) at line 348
+	m.visibleNodes = buildFilteredTree(searchRoot, matchingNodes, m.modeHidden)
 
 	m.displayed = len(m.visibleNodes)
 
@@ -413,59 +429,6 @@ func (m *model) selectedTreeNode() *treeNode {
 		return m.visibleNodes[m.treeIdx]
 	}
 	return nil
-}
-
-// findDeepestMatch finds the node with the highest depth among visible nodes
-func (m *model) findDeepestMatch() *treeNode {
-	if len(m.visibleNodes) == 0 {
-		return nil
-	}
-	deepest := m.visibleNodes[0]
-	maxDepth := deepest.depth
-	for _, node := range m.visibleNodes {
-		if node.depth > maxDepth {
-			maxDepth = node.depth
-			deepest = node
-		}
-	}
-	return deepest
-}
-
-// findLeafNodes finds all leaf nodes (files or directories with no children) in visible nodes
-func (m *model) findLeafNodes() []*treeNode {
-	var leafNodes []*treeNode
-	for _, node := range m.visibleNodes {
-		if node.entry == nil {
-			continue // Skip virtual root
-		}
-		// A leaf node is either:
-		// 1. A file
-		// 2. A directory with no children
-		if node.entry.hasMode(entryModeFile) {
-			leafNodes = append(leafNodes, node)
-		} else if node.entry.hasMode(entryModeDir) {
-			// Check if directory has no children (or children are all hidden)
-			if len(node.children) == 0 {
-				leafNodes = append(leafNodes, node)
-			} else {
-				// Check if all children are hidden
-				hasVisibleChildren := false
-				for _, child := range node.children {
-					if child.entry == nil {
-						continue
-					}
-					if m.modeHidden || !child.entry.hasMode(entryModeHidden) {
-						hasVisibleChildren = true
-						break
-					}
-				}
-				if !hasVisibleChildren {
-					leafNodes = append(leafNodes, node)
-				}
-			}
-		}
-	}
-	return leafNodes
 }
 
 func min(i, j int) int {

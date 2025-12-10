@@ -94,6 +94,17 @@ func (m *model) moveRight() {
 
 // Tree-mode cursor movements
 
+// exitFilteredSearchView clears the search filter and restores normal tree view
+func (m *model) exitFilteredSearchView() {
+	m.modeSearch = false
+	m.search = ""
+	m.treeSearchStartNode = nil
+	m.searchMatchNodes = nil
+	m.rebuildVisibleNodes()
+	m.treeIdx = 0
+	m.scrollOffset = 0
+}
+
 func (m *model) treeMoveUp() {
 	m.treeIdx--
 	if m.treeIdx < 0 {
@@ -114,6 +125,39 @@ func (m *model) treeMoveDown() {
 func (m *model) treeCollapse() {
 	node := m.selectedTreeNode()
 	if node == nil {
+		return
+	}
+
+	// If in filtered search view and at top-level child (parent is search start node),
+	// navigate up to parent directory instead of exiting filtered view
+	if m.search != "" && m.treeSearchStartNode != nil && node.parent == m.treeSearchStartNode {
+		// Navigate up directory tree from current path
+		parentPath, err := filepath.Abs(filepath.Join(m.path, ".."))
+		if err == nil && parentPath != m.path {
+			// Save the name of the directory we're leaving to position cursor on it after going up
+			_, childDirName := filepath.Split(m.path)
+			// Mark it as last visited so cursor will be positioned on it
+			m.treeLastChild[parentPath] = childDirName
+
+			m.saveCursor()
+			m.setPath(parentPath)
+			if err := m.listTree(); err != nil {
+				m.restorePath()
+				m.setError(err, err.Error())
+			} else {
+				// Clear search - the cursor positioning will be handled by listTree's logic
+				// which uses treeLastChild to position the cursor
+				m.exitFilteredSearchView()
+				// Find the child directory we came from and position cursor on it
+				for i, n := range m.visibleNodes {
+					if n.entry != nil && n.entry.Name() == childDirName {
+						m.treeIdx = i
+						m.adjustScrollOffset()
+						break
+					}
+				}
+			}
+		}
 		return
 	}
 
@@ -220,11 +264,54 @@ func (m *model) treeExpand() tea.Cmd {
 	return nil
 }
 
+// treeToggleExpand toggles expand/collapse state of directory
+func (m *model) treeToggleExpand() tea.Cmd {
+	node := m.selectedTreeNode()
+	if node == nil || node.entry == nil || !node.entry.hasMode(entryModeDir) {
+		return nil
+	}
+
+	if node.expanded {
+		// Collapse: just set expanded to false and rebuild
+		node.expanded = false
+		m.rebuildVisibleNodes()
+		m.adjustScrollOffset()
+		return nil
+	} else {
+		// Expand: load children and expand, but keep cursor on the directory (don't move into it)
+		if err := node.loadChildren(); err != nil {
+			m.setError(err, "failed to read directory")
+			return nil
+		}
+
+		node.expanded = true
+		m.rebuildVisibleNodes()
+		// Keep cursor on the same directory (don't move to children)
+		// Find the node again after rebuild to ensure cursor stays on it
+		for i, n := range m.visibleNodes {
+			if n == node {
+				m.treeIdx = i
+				break
+			}
+		}
+		m.adjustScrollOffset()
+		return nil
+	}
+}
+
 // adjustScrollOffset keeps cursor in viewport
 func (m *model) adjustScrollOffset() {
-	viewHeight := m.height - 2 // account for bars
+	// Use m.height - 3 to match treeView() (location bar + 2-line status bar)
+	viewHeight := m.height - 3
+	// Account for scroll indicators (worst case: both top and bottom)
+	if m.scrollOffset > 0 {
+		viewHeight-- // top indicator
+	}
+	if m.scrollOffset+viewHeight < len(m.visibleNodes) {
+		viewHeight-- // bottom indicator
+	}
 	if viewHeight <= 0 {
-		return
+		viewHeight = 1
 	}
 	if m.treeIdx < m.scrollOffset {
 		m.scrollOffset = m.treeIdx
@@ -232,4 +319,32 @@ func (m *model) adjustScrollOffset() {
 		newOffset := m.treeIdx - viewHeight + 1
 		m.scrollOffset = newOffset
 	}
+}
+
+// treeMoveToTop jumps to the first visible node
+func (m *model) treeMoveToTop() {
+	if len(m.visibleNodes) == 0 {
+		return
+	}
+	m.treeIdx = 0
+	m.scrollOffset = 0
+}
+
+// treeMoveToBottom jumps to the last visible node and scrolls view to bottom
+func (m *model) treeMoveToBottom() {
+	if len(m.visibleNodes) == 0 {
+		return
+	}
+	m.treeIdx = len(m.visibleNodes) - 1
+	// Scroll so the last item is at the bottom of the viewport
+	// Use m.height - 3 to match treeView() (location bar + 2-line status bar)
+	viewHeight := m.height - 3
+	// When jumping to bottom, there's no bottom indicator but likely a top indicator
+	if len(m.visibleNodes) > viewHeight {
+		viewHeight-- // Reserve space for top scroll indicator
+	}
+	if viewHeight <= 0 {
+		viewHeight = 1
+	}
+	m.scrollOffset = max(0, len(m.visibleNodes)-viewHeight)
 }

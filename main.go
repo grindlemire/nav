@@ -70,9 +70,14 @@ func main() {
 	lipgloss.SetColorProfile(output.ColorProfile())
 
 	// Run the app.
-	_, err = tea.NewProgram(m, tea.WithOutput(os.Stderr)).Run()
+	finalModel, err := tea.NewProgram(m, tea.WithOutput(os.Stderr)).Run()
 	if err != nil {
 		exit(err, m.exitCode)
+	}
+
+	// Write exit string to stdout if set
+	if finalModel, ok := finalModel.(*model); ok && finalModel.exitStr != "" {
+		fmt.Println(finalModel.exitStr)
 	}
 
 	exit(nil, m.exitCode)
