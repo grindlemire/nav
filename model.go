@@ -279,85 +279,17 @@ func (m *model) rebuildVisibleNodesWithSearch() {
 		return
 	}
 
-	// Determine search start node: use saved start node if available, otherwise fall back to root
-	searchStartNode := m.treeSearchStartNode
-	if searchStartNode == nil {
-		// Fallback: if no start node saved, use root (for backward compatibility)
-		// Collect all nodes from root
-		for _, child := range m.treeRoot.children {
-			if child.entry != nil && child.entry.hasMode(entryModeDir) {
-				_ = child.loadAllDescendants() // Ignore errors for unreadable dirs
-			}
-		}
-		allNodes := make([]*treeNode, 0)
-		for _, child := range m.treeRoot.children {
-			descendants := child.collectAllDescendants(m.modeHidden)
-			allNodes = append(allNodes, descendants...)
-		}
-		// Continue with fuzzy search logic below
-		if len(allNodes) == 0 {
-			m.displayed = 0
-			if m.treeIdx >= len(m.visibleNodes) {
-				m.treeIdx = 0
-			}
-			return
-		}
-		// Extract node names for fuzzy matching
-		nodeNames := make([]string, len(allNodes))
-		for i, node := range allNodes {
-			if node.entry != nil {
-				nodeNames[i] = node.entry.Name()
-			} else {
-				nodeNames[i] = ""
-			}
-		}
-		// Run fuzzy.Find to get matches
-		fuzzyMatches := fuzzy.Find(m.search, nodeNames)
-		if len(fuzzyMatches) == 0 {
-			m.displayed = 0
-			if m.treeIdx >= len(m.visibleNodes) {
-				m.treeIdx = 0
-			}
-			return
-		}
-		// Get matching nodes from fuzzy results
-		matchingNodes := make([]*treeNode, 0, len(fuzzyMatches))
-		for _, match := range fuzzyMatches {
-			if match.Index < len(allNodes) {
-				matchingNodes = append(matchingNodes, allNodes[match.Index])
-			}
-		}
-		// Store the actual matches for use when Enter is pressed
-		m.searchMatchNodes = matchingNodes
-		// Build filtered tree showing only branches to matches
-		searchRoot := m.treeRoot
-		if m.treeSearchStartNode != nil {
-			searchRoot = m.treeSearchStartNode
-		}
-		m.visibleNodes = buildFilteredTree(searchRoot, matchingNodes, m.modeHidden)
-		m.displayed = len(m.visibleNodes)
-		// Clamp cursor
-		if m.treeIdx >= len(m.visibleNodes) {
-			m.treeIdx = max(0, len(m.visibleNodes)-1)
-		}
-		return
+	// Use search start node if set, otherwise default to root
+	searchRoot := m.treeSearchStartNode
+	if searchRoot == nil {
+		searchRoot = m.treeRoot
 	}
 
-	// Search from parent of cursor position
-	// searchStartNode is already the parent (or root if at root level)
-	searchRoot := searchStartNode
+	// Note: Tree loading is now done when entering search mode (in actions.go)
+	// to avoid blocking I/O on every keystroke. The tree structure is pre-loaded
+	// once and reused for all subsequent search queries.
 
-	// 1. Recursively load all descendants from search root
-	if searchRoot.entry != nil && searchRoot.entry.hasMode(entryModeDir) {
-		_ = searchRoot.loadAllDescendants() // Ignore errors for unreadable dirs
-	}
-	for _, child := range searchRoot.children {
-		if child.entry != nil && child.entry.hasMode(entryModeDir) {
-			_ = child.loadAllDescendants() // Ignore errors for unreadable dirs
-		}
-	}
-
-	// 2. Collect all nodes from search root into flat list
+	// Collect all nodes from search root into flat list
 	allNodes := make([]*treeNode, 0)
 	if searchRoot == m.treeRoot {
 		// If searching from root, collect all root children's descendants
@@ -373,9 +305,7 @@ func (m *model) rebuildVisibleNodesWithSearch() {
 
 	if len(allNodes) == 0 {
 		m.displayed = 0
-		if m.treeIdx >= len(m.visibleNodes) {
-			m.treeIdx = 0
-		}
+		m.treeIdx = 0
 		return
 	}
 
@@ -391,12 +321,9 @@ func (m *model) rebuildVisibleNodesWithSearch() {
 
 	// 4. Run fuzzy.Find to get matches
 	fuzzyMatches := fuzzy.Find(m.search, nodeNames)
-
 	if len(fuzzyMatches) == 0 {
 		m.displayed = 0
-		if m.treeIdx >= len(m.visibleNodes) {
-			m.treeIdx = 0
-		}
+		m.treeIdx = 0
 		return
 	}
 
@@ -412,9 +339,7 @@ func (m *model) rebuildVisibleNodesWithSearch() {
 	m.searchMatchNodes = matchingNodes
 
 	// 6. Build filtered tree showing only branches to matches
-	// searchRoot is already set to searchStartNode (m.treeSearchStartNode) at line 348
 	m.visibleNodes = buildFilteredTree(searchRoot, matchingNodes, m.modeHidden)
-
 	m.displayed = len(m.visibleNodes)
 
 	// Clamp cursor

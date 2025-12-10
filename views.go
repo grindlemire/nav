@@ -426,11 +426,7 @@ func (m *model) treeLocationBar() string {
 	if node := m.selectedTreeNode(); node != nil {
 		path = node.fullPath
 	}
-
-	// Only replace home dir with ~ if path is within home directory
-	if userHomeDir, err := os.UserHomeDir(); err == nil && strings.HasPrefix(path, userHomeDir) {
-		path = strings.Replace(path, userHomeDir, "~", 1)
-	}
+	path = substituteHomeDir(path)
 	if runtime.GOOS == "windows" {
 		path = strings.ReplaceAll(strings.Replace(path, "\\/", fileSeparator, 1), "/", fileSeparator)
 	}
@@ -492,16 +488,9 @@ func (m *model) treeSearchLocationBar() string {
 	parentName := ""
 	if m.treeSearchStartNode != nil {
 		if m.treeSearchStartNode == m.treeRoot {
-			// Searching from root - use the base path name
-			parentName = m.path
-			if userHomeDir, err := os.UserHomeDir(); err == nil && strings.HasPrefix(parentName, userHomeDir) {
-				parentName = strings.Replace(parentName, userHomeDir, "~", 1)
-			}
+			parentName = substituteHomeDir(m.path)
 		} else if m.treeSearchStartNode.entry != nil {
-			parentName = m.treeSearchStartNode.fullPath
-			if userHomeDir, err := os.UserHomeDir(); err == nil && strings.HasPrefix(parentName, userHomeDir) {
-				parentName = strings.Replace(parentName, userHomeDir, "~", 1)
-			}
+			parentName = substituteHomeDir(m.treeSearchStartNode.fullPath)
 		}
 	}
 	if parentName == "" {
@@ -538,4 +527,12 @@ func max(i, j int) int {
 		return i
 	}
 	return j
+}
+
+// substituteHomeDir replaces the user's home directory with ~ in a path
+func substituteHomeDir(path string) string {
+	if userHomeDir, err := os.UserHomeDir(); err == nil && strings.HasPrefix(path, userHomeDir) {
+		return strings.Replace(path, userHomeDir, "~", 1)
+	}
+	return path
 }

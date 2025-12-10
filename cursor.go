@@ -94,17 +94,6 @@ func (m *model) moveRight() {
 
 // Tree-mode cursor movements
 
-// exitFilteredSearchView clears the search filter and restores normal tree view
-func (m *model) exitFilteredSearchView() {
-	m.modeSearch = false
-	m.search = ""
-	m.treeSearchStartNode = nil
-	m.searchMatchNodes = nil
-	m.rebuildVisibleNodes()
-	m.treeIdx = 0
-	m.scrollOffset = 0
-}
-
 func (m *model) treeMoveUp() {
 	m.treeIdx--
 	if m.treeIdx < 0 {
@@ -128,15 +117,46 @@ func (m *model) treeCollapse() {
 		return
 	}
 
+	// If in filtered search view, exit to normal tree view at current directory
+	if m.search != "" {
+		// Save the search start node's name for cursor positioning
+		var searchStartDirName string
+		if m.treeSearchStartNode != nil && m.treeSearchStartNode.entry != nil {
+			searchStartDirName = m.treeSearchStartNode.entry.Name()
+		}
+
+		// Clear search state and exit search mode
+		m.modeSearch = false
+		m.search = ""
+		m.treeSearchStartNode = nil
+		m.searchMatchNodes = nil
+
+		// Rebuild visible nodes (unfiltered tree)
+		m.rebuildVisibleNodes()
+
+		// Position cursor on the directory we were searching in
+		if searchStartDirName != "" {
+			for i, n := range m.visibleNodes {
+				if n.entry != nil && n.entry.Name() == searchStartDirName {
+					m.treeIdx = i
+					m.adjustScrollOffset()
+					return
+				}
+			}
+		}
+		// If we couldn't find the search start directory, just reset to top
+		m.treeIdx = 0
+		m.scrollOffset = 0
+		return
+	}
+
 	// If in filtered search view and at top-level child (parent is search start node),
 	// navigate up to parent directory instead of exiting filtered view
 	if m.search != "" && m.treeSearchStartNode != nil && node.parent == m.treeSearchStartNode {
-		// Navigate up directory tree from current path
 		parentPath, err := filepath.Abs(filepath.Join(m.path, ".."))
 		if err == nil && parentPath != m.path {
-			// Save the name of the directory we're leaving to position cursor on it after going up
 			_, childDirName := filepath.Split(m.path)
-			// Mark it as last visited so cursor will be positioned on it
+			// Mark as last visited so re-expanding later will remember this position
 			m.treeLastChild[parentPath] = childDirName
 
 			m.saveCursor()
@@ -145,10 +165,12 @@ func (m *model) treeCollapse() {
 				m.restorePath()
 				m.setError(err, err.Error())
 			} else {
-				// Clear search - the cursor positioning will be handled by listTree's logic
-				// which uses treeLastChild to position the cursor
-				m.exitFilteredSearchView()
-				// Find the child directory we came from and position cursor on it
+				// Clear search state and position cursor on the directory we came from
+				m.modeSearch = false
+				m.search = ""
+				m.treeSearchStartNode = nil
+				m.searchMatchNodes = nil
+				m.rebuildVisibleNodes()
 				for i, n := range m.visibleNodes {
 					if n.entry != nil && n.entry.Name() == childDirName {
 						m.treeIdx = i

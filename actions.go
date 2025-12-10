@@ -320,6 +320,21 @@ func actionModeTree(m *model, msg tea.KeyMsg, esc bool) actionResult {
 				// No parent (at root level), use root
 				m.treeSearchStartNode = m.treeRoot
 			}
+			// Pre-load all descendants ONCE when entering search mode
+			// This avoids blocking I/O on every keystroke
+			if m.treeSearchStartNode != nil {
+				if m.treeSearchStartNode.entry != nil && m.treeSearchStartNode.entry.hasMode(entryModeDir) {
+					_ = m.treeSearchStartNode.loadAllDescendants() // Ignore errors for unreadable dirs
+				}
+				// Also load all root children if searching from root
+				if m.treeSearchStartNode == m.treeRoot {
+					for _, child := range m.treeSearchStartNode.children {
+						if child.entry != nil && child.entry.hasMode(entryModeDir) {
+							_ = child.loadAllDescendants() // Ignore errors for unreadable dirs
+						}
+					}
+				}
+			}
 			return newActionResult(nil)
 		}
 		// If already in search mode, "/" should be handled by search handler
