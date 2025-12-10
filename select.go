@@ -70,6 +70,66 @@ func (m *model) selectAction() (*model, tea.Cmd) {
 }
 
 func (m *model) searchSelectAction() (*model, tea.Cmd) {
+	// In tree mode, use tree selection logic
+	if m.modeTree {
+		node := m.selectedTreeNode()
+		if node == nil || node.entry == nil {
+			m.setError(errors.New("no node selected"), "failed to select entry")
+			m.clearSearch()
+			return m, nil
+		}
+
+		m.saveCursor()
+
+		if node.entry.hasMode(entryModeFile) {
+			m.setExit(sanitize.SanitizeOutputPath(node.fullPath))
+			if m.modeSubshell {
+				fmt.Print(m.exitStr)
+			}
+			m.clearSearch()
+			return m, tea.Quit
+		}
+
+		if node.entry.hasMode(entryModeSymlink) {
+			sl, err := followSymlink(m.path, node.entry)
+			if err != nil {
+				m.setError(err, "failed to evaluate symlink")
+				m.clearSearch()
+				return m, nil
+			}
+			if !sl.info.IsDir() {
+				m.setExit(sanitize.SanitizeOutputPath(sl.absPath))
+				if m.modeSubshell {
+					fmt.Print(m.exitStr)
+				}
+				m.clearSearch()
+				return m, tea.Quit
+			}
+			m.setPath(sl.absPath)
+		} else if node.entry.hasMode(entryModeDir) {
+			m.setPath(node.fullPath)
+		} else {
+			m.setError(
+				errors.New("selection is not a file, directory, or symlink"),
+				"unexpected file type",
+			)
+			m.clearSearch()
+			return m, nil
+		}
+
+		m.search = ""
+		err := m.listTree()
+		if err != nil {
+			m.restorePath()
+			m.setError(err, err.Error())
+			m.clearSearch()
+		} else {
+			m.treeIdx = 0
+			m.scrollOffset = 0
+		}
+		return m, nil
+	}
+
 	selected, err := m.selected()
 	if err != nil {
 		m.setError(err, "failed to select entry")

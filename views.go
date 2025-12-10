@@ -5,7 +5,90 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/lipgloss"
 )
+
+func (m *model) treeView() string {
+	if len(m.visibleNodes) == 0 {
+		return m.locationBar() + "\n\n\t(no entries)\n"
+	}
+
+	viewHeight := m.height - 2
+	displayNameOpts := m.displayNameOpts()
+
+	var output []string
+	output = append(output, m.locationBar())
+
+	// Render visible slice based on scroll offset
+	endIdx := min(m.scrollOffset+viewHeight, len(m.visibleNodes))
+
+	for i := m.scrollOffset; i < endIdx; i++ {
+		node := m.visibleNodes[i]
+		rawLine := m.renderTreeNode(node, displayNameOpts)
+
+		// Pad line to full terminal width to ensure consistent diff rendering
+		lineWidth := lipgloss.Width(rawLine)
+		paddedLine := rawLine
+		if lineWidth < m.width {
+			paddedLine = rawLine + strings.Repeat(" ", m.width-lineWidth)
+		}
+
+		var finalLine string
+		if i == m.treeIdx {
+			if m.markedTreeNode(i) {
+				finalLine = cursorRendererSelectedMarked.Render(paddedLine)
+			} else {
+				finalLine = cursorRendererSelected.Render(paddedLine)
+			}
+		} else {
+			if m.markedTreeNode(i) {
+				finalLine = cursorRendererMarked.Render(paddedLine)
+			} else {
+				finalLine = cursorRendererNormal.Render(paddedLine)
+			}
+		}
+
+		output = append(output, finalLine)
+	}
+
+	// Pad output to fill viewport height (prevents ghost lines from previous renders)
+	emptyLine := strings.Repeat(" ", m.width)
+	for len(output) < m.height-1 { // -1 for status bar
+		output = append(output, cursorRendererNormal.Render(emptyLine))
+	}
+
+	return strings.Join(output, "\n")
+}
+
+func (m *model) renderTreeNode(node *treeNode, opts []displayNameOption) string {
+	indent := strings.Repeat("  ", node.depth) // 2-space per level
+
+	// Expand/collapse indicator
+	var indicator string
+	if node.entry != nil && node.entry.hasMode(entryModeDir) {
+		if node.expanded {
+			indicator = "▼ "
+		} else {
+			indicator = "▶ "
+		}
+	} else {
+		indicator = "  " // align with dirs
+	}
+
+	if node.entry == nil {
+		// Virtual root - shouldn't happen in normal rendering
+		return ""
+	}
+
+	name := newDisplayName(node.entry, opts...)
+	return indent + indicator + name.String()
+}
+
+func (m *model) markedTreeNode(idx int) bool {
+	// In tree mode, marks are based on visible node index
+	_, marked := m.marks[idx]
+	return marked
+}
 
 func (m *model) normalView() string {
 	var (
@@ -117,20 +200,6 @@ func (m *model) normalView() string {
 	return strings.Join(output, "\n")
 }
 
-func (m *model) debugView() string {
-	output := barRendererOK.Render("No errors")
-	if m.modeError {
-		output = fmt.Sprintf(
-			"%s\n %s\n\n%s\n %v",
-			barRendererError.Render("Error Message"),
-			m.errorStr,
-			barRendererError.Render("Error"),
-			m.error,
-		)
-	}
-	return fmt.Sprintf("%s\n\n", output)
-}
-
 type statusBarItem string
 
 func (s statusBarItem) String() string { return string(s) }
@@ -144,13 +213,7 @@ func (m *model) statusBar() string {
 		cmds []statusBarItem
 	)
 
-	if m.modeDebug {
-		mode = "DEBUG"
-		cmds = []statusBarItem{
-			statusBarItem(fmt.Sprintf(`"%s": dismiss error`, keyString(keyDismissError))),
-			statusBarItem(fmt.Sprintf(`"%s": normal mode`, keyString(keyEsc))),
-		}
-	} else if m.modeSearch {
+	if m.modeSearch {
 		mode = "SEARCH"
 		cmds = []statusBarItem{
 			statusBarItem(fmt.Sprintf(`"%s": complete`, keyString(keyTab))),
@@ -213,9 +276,8 @@ func (m *model) locationBar() string {
 	err := ""
 	if m.modeError {
 		err = fmt.Sprintf(
-			"\tERROR (\"%s\": dismiss, \"%s\": debug): %s",
+			"\tERROR (\"%s\": dismiss): %s",
 			keyString(keyDismissError),
-			keyString(keyModeDebug),
 			m.errorStr,
 		)
 		return barRendererError.Render(err + "\t\t")

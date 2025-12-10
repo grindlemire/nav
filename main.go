@@ -36,6 +36,7 @@ const (
 	flagNoStatusBar         = "--no-status-bar"
 	flagNoTrailing          = "--no-trailing"
 	flagRemapEsc            = "--remap-esc"
+	flagNoClearScreenFix    = "--no-clear-fix"
 )
 
 func main() {
@@ -97,6 +98,8 @@ func parseArgs(args []string, m *model) error {
 			m.modeTrailing = false
 		case flagNoStatusBar:
 			m.hideStatusBar = true
+		case flagNoClearScreenFix:
+			m.noClearScreenFix = true
 		case flagRemapEsc:
 			if i > len(args)-2 {
 				return fmt.Errorf("%s must be followed by a string value", flagRemapEsc)

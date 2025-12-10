@@ -41,6 +41,8 @@ func commands() string {
 
 	Arrow keys are used to move the cursor.
 	Vim navigation is available using "h" (left), "j" (down) "k" (up), and "l" (right).
+	In tree view mode, "h" collapses directories or goes up a level, "l" expands directories,
+	and "j"/"k" navigate through the visible tree.
 
 %s
 `
@@ -52,7 +54,6 @@ func commands() string {
 		usageKeyLine("returns the path to the current directory", keyReturnDirectory),
 		"",
 		usageKeyLine("enters search mode (insert into the path)", keyModeSearch),
-		usageKeyLine("enters debug mode  (view error details)", keyModeDebug),
 		usageKeyLine("enters help mode", keyModeHelp),
 		usageKeyLine("switches back to normal mode or clears search filter in normal mode", keyEsc),
 		"",
@@ -62,6 +63,7 @@ func commands() string {
 		usageKeyLine("toggles showing hidden files (ls -a)", keyToggleHidden),
 		usageKeyLine("toggles listing full file information (ls -l)", keyToggleList),
 		usageKeyLine("toggles following symlinks", keyToggleFollowSymlink),
+		usageKeyLine("toggles tree view mode", keyToggleTree),
 		"",
 		usageKeyLine("dismisses errors", keyDismissError),
 		usageKeyLine("quits the application with no return value", keyQuit),
@@ -109,6 +111,8 @@ func flags() string {
 		usageFlagLine("toggle off trailing annotators", flagNoTrailing),
 		"",
 		usageFlagLine("remap the escape key to the following value, using\nrepeated values to require multiple presses", flagRemapEsc),
+		"",
+		usageFlagLine("disable ClearScreen fix for tree expand\n(exposes Bubble Tea rendering bug)", flagNoClearScreenFix),
 	}
 	return fmt.Sprintf(usage, strings.Join(flags, "\n"))
 }

@@ -27,13 +27,13 @@ var (
 	keyLeft  = key.NewBinding(key.WithKeys("left", "h"))
 	keyRight = key.NewBinding(key.WithKeys("right", "l"))
 
-	keyModeDebug  = key.NewBinding(key.WithKeys("d"))
 	keyModeHelp   = key.NewBinding(key.WithKeys("H"))
 	keyModeSearch = key.NewBinding(key.WithKeys("i"))
 
 	keyToggleFollowSymlink = key.NewBinding(key.WithKeys("f"))
 	keyToggleHidden        = key.NewBinding(key.WithKeys("a"))
 	keyToggleList          = key.NewBinding(key.WithKeys("L"))
+	keyToggleTree          = key.NewBinding(key.WithKeys("t"))
 
 	keyDismissError = key.NewBinding(key.WithKeys("e"))
 )

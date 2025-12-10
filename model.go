@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/sahilm/fuzzy"
 )
 
 var fileSeparator = string(filepath.Separator)
@@ -33,7 +35,6 @@ type model struct {
 	height  int // Terminal height.
 
 	modeColor         bool
-	modeDebug         bool
 	modeError         bool
 	modeExit          bool
 	modeFollowSymlink bool
@@ -44,8 +45,18 @@ type model struct {
 	modeSearch        bool
 	modeSubshell      bool
 	modeTrailing      bool
+	modeTree          bool
 
 	hideStatusBar bool
+
+	// Fix flags
+	noClearScreenFix bool
+
+	// Tree mode fields
+	treeRoot     *treeNode
+	visibleNodes []*treeNode
+	treeIdx      int
+	scrollOffset int
 }
 
 func newModel() *model {
@@ -57,7 +68,6 @@ func newModel() *model {
 		marks:     make(map[int]int),
 
 		modeColor:         true,
-		modeDebug:         false,
 		modeError:         false,
 		modeExit:          false,
 		modeFollowSymlink: false,
@@ -68,13 +78,17 @@ func newModel() *model {
 		modeSearch:        false,
 		modeSubshell:      false,
 		modeTrailing:      true,
+		modeTree:          false,
 
 		hideStatusBar: false,
+
+		treeIdx:      0,
+		scrollOffset: 0,
 	}
 }
 
 func (m *model) normalMode() bool {
-	return !(m.modeSearch || m.modeDebug || m.modeHelp)
+	return !(m.modeSearch || m.modeHelp)
 }
 
 func (m *model) list() error {
@@ -184,4 +198,158 @@ func (m *model) clearSearch() {
 
 func index(c int, r int, rows int) int {
 	return r + (c * rows)
+}
+
+// listTree builds tree structure from current path
+func (m *model) listTree() error {
+	files, err := os.ReadDir(m.path)
+	if err != nil {
+		return err
+	}
+
+	entries := make([]*entry, 0, len(files))
+	for _, f := range files {
+		ent, err := newEntry(f)
+		if err != nil {
+			return err
+		}
+		entries = append(entries, ent)
+	}
+	sortEntries(entries)
+
+	// Create virtual root node (current directory contents are roots)
+	m.treeRoot = &treeNode{
+		entry:    nil, // virtual root
+		fullPath: m.path,
+		expanded: true,
+		loaded:   true,
+	}
+
+	for _, ent := range entries {
+		m.treeRoot.children = append(m.treeRoot.children,
+			newTreeNode(ent, m.treeRoot, m.path))
+	}
+
+	m.rebuildVisibleNodes()
+	return nil
+}
+
+// rebuildVisibleNodes flattens expanded tree into visible nodes list
+func (m *model) rebuildVisibleNodes() {
+	if m.search != "" {
+		m.rebuildVisibleNodesWithSearch()
+		return
+	}
+
+	m.visibleNodes = nil
+	if m.treeRoot != nil {
+		for _, child := range m.treeRoot.children {
+			child.flattenInto(&m.visibleNodes, m.modeHidden)
+		}
+	}
+	m.displayed = len(m.visibleNodes)
+
+	// Clamp cursor
+	if m.treeIdx >= len(m.visibleNodes) {
+		m.treeIdx = max(0, len(m.visibleNodes)-1)
+	}
+}
+
+// rebuildVisibleNodesWithSearch filters visible nodes by fuzzy search query
+func (m *model) rebuildVisibleNodesWithSearch() {
+	m.visibleNodes = nil
+	if m.treeRoot == nil || m.search == "" {
+		m.displayed = len(m.visibleNodes)
+		if m.treeIdx >= len(m.visibleNodes) {
+			m.treeIdx = max(0, len(m.visibleNodes)-1)
+		}
+		return
+	}
+
+	// 1. Recursively load all descendants from root
+	for _, child := range m.treeRoot.children {
+		if child.entry != nil && child.entry.hasMode(entryModeDir) {
+			_ = child.loadAllDescendants() // Ignore errors for unreadable dirs
+		}
+	}
+
+	// 2. Collect all nodes into flat list
+	allNodes := make([]*treeNode, 0)
+	for _, child := range m.treeRoot.children {
+		descendants := child.collectAllDescendants(m.modeHidden)
+		allNodes = append(allNodes, descendants...)
+	}
+
+	if len(allNodes) == 0 {
+		m.displayed = 0
+		if m.treeIdx >= len(m.visibleNodes) {
+			m.treeIdx = 0
+		}
+		return
+	}
+
+	// 3. Extract node names for fuzzy matching
+	nodeNames := make([]string, len(allNodes))
+	for i, node := range allNodes {
+		if node.entry != nil {
+			nodeNames[i] = node.entry.Name()
+		} else {
+			nodeNames[i] = ""
+		}
+	}
+
+	// 4. Run fuzzy.Find to get matches
+	fuzzyMatches := fuzzy.Find(m.search, nodeNames)
+
+	if len(fuzzyMatches) == 0 {
+		m.displayed = 0
+		if m.treeIdx >= len(m.visibleNodes) {
+			m.treeIdx = 0
+		}
+		return
+	}
+
+	// 5. Get matching nodes from fuzzy results
+	matchingNodes := make([]*treeNode, 0, len(fuzzyMatches))
+	for _, match := range fuzzyMatches {
+		if match.Index < len(allNodes) {
+			matchingNodes = append(matchingNodes, allNodes[match.Index])
+		}
+	}
+
+	// 6. Build filtered tree showing only branches to matches
+	m.visibleNodes = buildFilteredTree(m.treeRoot, matchingNodes, m.modeHidden)
+
+	m.displayed = len(m.visibleNodes)
+
+	// Clamp cursor
+	if m.treeIdx >= len(m.visibleNodes) {
+		m.treeIdx = max(0, len(m.visibleNodes)-1)
+	}
+}
+
+// selectedTreeNode returns the currently selected tree node
+func (m *model) selectedTreeNode() *treeNode {
+	if m.treeIdx >= 0 && m.treeIdx < len(m.visibleNodes) {
+		return m.visibleNodes[m.treeIdx]
+	}
+	return nil
+}
+
+func min(i, j int) int {
+	if i < j {
+		return i
+	}
+	return j
+}
+
+// toggleTreeMark toggles mark on current tree node
+func (m *model) toggleTreeMark() {
+	if m.markedTreeNode(m.treeIdx) {
+		delete(m.marks, m.treeIdx)
+		m.modeMarks = len(m.marks) != 0
+	} else {
+		m.marks[m.treeIdx] = m.treeIdx // In tree mode, displayIdx == entryIdx conceptually
+		m.modeMarks = true
+	}
 }

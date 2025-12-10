@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -25,11 +26,12 @@ func (m *model) View() string {
 	}
 	if m.modeHelp {
 		view = commands()
-	} else if m.modeDebug {
-		view = m.debugView()
+	} else if m.modeTree {
+		view = m.treeView()
 	} else {
 		view = m.normalView()
 	}
+
 	if m.hideStatusBar {
 		return view
 	}
@@ -85,6 +87,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		if m.modeTree {
+			if result := actionModeTree(m, msg, esc); !result.noop {
+				return m, result.cmd
+			}
+		}
+
 		if result := actionModeGeneral(m, msg, esc); !result.noop {
 			return m, result.cmd
 		}
@@ -130,26 +138,8 @@ func actionQuit(m *model, msg tea.KeyMsg, esc bool) actionResult {
 }
 
 func actionModeError(m *model, msg tea.KeyMsg, esc bool) actionResult {
-	// Debug mode
-	if m.modeDebug {
-		if esc || key.Matches(msg, keyEsc) || key.Matches(msg, keyModeDebug) {
-			m.modeDebug = false
-		}
-
-		if key.Matches(msg, keyDismissError) {
-			m.clearError()
-			m.modeDebug = false
-		}
-
-		return newActionResult(nil)
-	}
-
 	if key.Matches(msg, keyDismissError) {
 		m.clearError()
-	}
-
-	if key.Matches(msg, keyModeDebug) {
-		m.modeDebug = true
 	}
 
 	return newActionResult(nil)
@@ -168,6 +158,9 @@ func actionModeSearch(m *model, msg tea.KeyMsg, esc bool) actionResult {
 	if esc || key.Matches(msg, keyEsc) {
 		// Exit search mode but keep the search filter active in normal mode.
 		m.modeSearch = false
+		if m.modeTree {
+			m.rebuildVisibleNodes()
+		}
 		return newActionResult(nil)
 	}
 
@@ -180,6 +173,9 @@ func actionModeSearch(m *model, msg tea.KeyMsg, esc bool) actionResult {
 	case key.Matches(msg, keyBack):
 		if len(m.search) > 0 {
 			m.search = m.search[:len(m.search)-1]
+			if m.modeTree {
+				m.rebuildVisibleNodes()
+			}
 			return newActionResult(nil)
 		}
 
@@ -228,6 +224,9 @@ func actionModeSearch(m *model, msg tea.KeyMsg, esc bool) actionResult {
 	default:
 		if msg.Type == tea.KeyRunes || key.Matches(msg, keySpace) {
 			m.search += string(msg.Runes)
+			if m.modeTree {
+				m.rebuildVisibleNodes()
+			}
 			return newActionResult(nil)
 		}
 
@@ -246,6 +245,116 @@ func actionModeMarks(m *model, msg tea.KeyMsg, esc bool) actionResult {
 	}
 
 	return newActionResultNoop()
+}
+
+func actionModeTree(m *model, msg tea.KeyMsg, esc bool) actionResult {
+	switch {
+
+	case key.Matches(msg, keyModeSearch):
+		// Enter search mode
+		m.modeSearch = true
+		return newActionResult(nil)
+
+	case key.Matches(msg, keyUp):
+		m.treeMoveUp()
+		return newActionResult(nil)
+
+	case key.Matches(msg, keyDown):
+		m.treeMoveDown()
+		return newActionResult(nil)
+
+	case key.Matches(msg, keyLeft):
+		m.treeCollapse()
+		return newActionResult(nil)
+
+	case key.Matches(msg, keyRight):
+		cmd := m.treeExpand()
+		return newActionResult(cmd)
+
+	case key.Matches(msg, keySelect):
+		result := m.treeSelectAction()
+		return result
+
+	case key.Matches(msg, keyMark):
+		if !m.modeSearch {
+			m.toggleTreeMark()
+			return newActionResult(nil)
+		}
+
+	case key.Matches(msg, keyBack):
+		// Backspace only active in search mode for tree
+		if m.modeSearch {
+			return newActionResultNoop() // Let search handler deal with it
+		}
+		return newActionResultNoop() // No-op in tree mode
+
+	}
+
+	return newActionResultNoop()
+}
+
+func (m *model) treeSelectAction() actionResult {
+	node := m.selectedTreeNode()
+	if node == nil || node.entry == nil {
+		return newActionResult(nil)
+	}
+
+	m.saveCursor()
+
+	// For files: return path and quit (same as current behavior)
+	if node.entry.hasMode(entryModeFile) {
+		m.setExit(sanitize.SanitizeOutputPath(node.fullPath))
+		if m.modeSubshell {
+			fmt.Print(m.exitStr)
+		}
+		return newActionResult(tea.Quit)
+	}
+
+	// For directories: descend (make this dir the new root)
+	if node.entry.hasMode(entryModeDir) {
+		m.setPath(node.fullPath)
+		if err := m.listTree(); err != nil {
+			m.restorePath()
+			m.setError(err, err.Error())
+		} else {
+			m.treeIdx = 0
+			m.scrollOffset = 0
+		}
+		return newActionResult(nil)
+	}
+
+	// Handle symlinks
+	if node.entry.hasMode(entryModeSymlink) {
+		sl, err := followSymlink(m.path, node.entry)
+		if err != nil {
+			m.setError(err, "failed to evaluate symlink")
+			return newActionResult(nil)
+		}
+		if !sl.info.IsDir() {
+			// The symlink points to a file.
+			m.setExit(sanitize.SanitizeOutputPath(sl.absPath))
+			if m.modeSubshell {
+				fmt.Print(m.exitStr)
+			}
+			return newActionResult(tea.Quit)
+		}
+		// The symlink points to a directory.
+		m.setPath(sl.absPath)
+		if err := m.listTree(); err != nil {
+			m.restorePath()
+			m.setError(err, err.Error())
+		} else {
+			m.treeIdx = 0
+			m.scrollOffset = 0
+		}
+		return newActionResult(nil)
+	}
+
+	m.setError(
+		errors.New("selection is not a file, directory, or symlink"),
+		"unexpected file type",
+	)
+	return newActionResult(nil)
 }
 
 func actionModeGeneral(m *model, msg tea.KeyMsg, esc bool) actionResult {
@@ -385,9 +494,33 @@ func actionModeGeneral(m *model, msg tea.KeyMsg, esc bool) actionResult {
 
 	case key.Matches(msg, keyToggleHidden):
 		m.modeHidden = !m.modeHidden
+		if m.modeTree {
+			m.rebuildVisibleNodes()
+		}
 
 	case key.Matches(msg, keyToggleList):
 		m.modeList = !m.modeList
+
+	case key.Matches(msg, keyToggleTree):
+		m.modeTree = !m.modeTree
+		if m.modeTree {
+			// Initialize tree mode
+			if err := m.listTree(); err != nil {
+				m.setError(err, "failed to initialize tree view")
+				m.modeTree = false
+			} else {
+				m.treeIdx = 0
+				m.scrollOffset = 0
+			}
+		} else {
+			// Switch back to normal mode
+			if err := m.list(); err != nil {
+				m.setError(err, "failed to switch to normal view")
+				m.modeTree = true
+			} else {
+				m.resetCursor()
+			}
+		}
 
 	}
 
