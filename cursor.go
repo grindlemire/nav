@@ -117,15 +117,20 @@ func (m *model) treeCollapse() {
 		return
 	}
 
-	// If on expanded directory, collapse it
-	if node.expanded && node.entry != nil && node.entry.hasMode(entryModeDir) {
-		node.expanded = false
-		m.rebuildVisibleNodes()
-		return
-	}
-
-	// If node has a parent within the tree, move cursor to parent
+	// If node has a parent within the tree, collapse parent and move up
 	if node.parent != nil && node.parent != m.treeRoot {
+		// Remember this child for re-expansion using path-based tracking.
+		// We use path/name instead of pointer because tree nodes get recreated
+		// when navigating up directories, searching, or when the filesystem changes.
+		if node.entry != nil {
+			m.treeLastChild[node.parent.fullPath] = node.entry.Name()
+		}
+
+		// Collapse the parent so pressing 'l' will expand and restore position
+		node.parent.expanded = false
+
+		// Move cursor to parent and rebuild
+		m.rebuildVisibleNodes()
 		for i, n := range m.visibleNodes {
 			if n == node.parent {
 				m.treeIdx = i
@@ -133,19 +138,35 @@ func (m *model) treeCollapse() {
 				return
 			}
 		}
+		return
+	}
+
+	// At root level: save current child before going up to parent directory
+	if node.entry != nil {
+		m.treeLastChild[m.path] = node.entry.Name()
 	}
 
 	// Only at root level: go up to parent directory as new root
 	parentPath, err := filepath.Abs(filepath.Join(m.path, ".."))
 	if err == nil && parentPath != m.path {
 		m.saveCursor()
+		// Save the name of the directory we're leaving to position cursor on it after going up
+		_, childDirName := filepath.Split(m.path)
 		m.setPath(parentPath)
 		if err := m.listTree(); err != nil {
 			m.restorePath()
 			m.setError(err, err.Error())
 		} else {
+			// Find the child directory we came from and position cursor on it
 			m.treeIdx = 0
 			m.scrollOffset = 0
+			for i, n := range m.visibleNodes {
+				if n.entry != nil && n.entry.Name() == childDirName {
+					m.treeIdx = i
+					m.adjustScrollOffset()
+					break
+				}
+			}
 		}
 	}
 }
@@ -166,14 +187,34 @@ func (m *model) treeExpand() tea.Cmd {
 
 		node.expanded = true
 		m.rebuildVisibleNodes()
+
+		// Position cursor on last selected child if exists, otherwise first child
+		found := false
+		if childName, ok := m.treeLastChild[node.fullPath]; ok {
+			for i, n := range m.visibleNodes {
+				if n.entry != nil && n.entry.Name() == childName && n.parent == node {
+					m.treeIdx = i
+					found = true
+					break
+				}
+			}
+		}
+
+		// Fallback: jump to first child
+		if !found && len(node.children) > 0 {
+			for i, n := range m.visibleNodes {
+				if n == node {
+					// First child is at i+1 (if it exists)
+					if i+1 < len(m.visibleNodes) {
+						m.treeIdx = i + 1
+					}
+					break
+				}
+			}
+		}
 		m.adjustScrollOffset()
 
-		// Return ClearScreen to force full re-render (workaround for Bubble Tea diff bug)
-		// Can be disabled with --no-clear-fix flag
-		if m.noClearScreenFix {
-			return nil
-		}
-		return tea.ClearScreen
+		return nil
 	}
 
 	return nil

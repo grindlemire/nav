@@ -49,14 +49,18 @@ type model struct {
 
 	hideStatusBar bool
 
-	// Fix flags
-	noClearScreenFix bool
-
 	// Tree mode fields
 	treeRoot     *treeNode
 	visibleNodes []*treeNode
 	treeIdx      int
 	scrollOffset int
+	// treeLastChild maps parent directory path to the name of the last selected child.
+	// Used to restore cursor position when re-expanding a previously collapsed directory.
+	// Path-based (not pointer-based) so it survives tree node recreation during navigation.
+	treeLastChild map[string]string
+	// treeSearchStartNode is the node at cursor position when search mode is entered.
+	// Search will be scoped to this node's subtree (or its parent's subtree if it's a file).
+	treeSearchStartNode *treeNode
 }
 
 func newModel() *model {
@@ -82,8 +86,10 @@ func newModel() *model {
 
 		hideStatusBar: false,
 
-		treeIdx:      0,
-		scrollOffset: 0,
+		treeIdx:             0,
+		scrollOffset:        0,
+		treeLastChild:       make(map[string]string),
+		treeSearchStartNode: nil,
 	}
 }
 
@@ -194,6 +200,7 @@ func (m *model) setExitWithCode(exitStr string, exitCode int) {
 func (m *model) clearSearch() {
 	m.modeSearch = false
 	m.search = ""
+	m.treeSearchStartNode = nil
 }
 
 func index(c int, r int, rows int) int {
@@ -266,17 +273,89 @@ func (m *model) rebuildVisibleNodesWithSearch() {
 		return
 	}
 
-	// 1. Recursively load all descendants from root
-	for _, child := range m.treeRoot.children {
+	// Determine search start node: use saved start node if available, otherwise fall back to root
+	searchStartNode := m.treeSearchStartNode
+	if searchStartNode == nil {
+		// Fallback: if no start node saved, use root (for backward compatibility)
+		// Collect all nodes from root
+		for _, child := range m.treeRoot.children {
+			if child.entry != nil && child.entry.hasMode(entryModeDir) {
+				_ = child.loadAllDescendants() // Ignore errors for unreadable dirs
+			}
+		}
+		allNodes := make([]*treeNode, 0)
+		for _, child := range m.treeRoot.children {
+			descendants := child.collectAllDescendants(m.modeHidden)
+			allNodes = append(allNodes, descendants...)
+		}
+		// Continue with fuzzy search logic below
+		if len(allNodes) == 0 {
+			m.displayed = 0
+			if m.treeIdx >= len(m.visibleNodes) {
+				m.treeIdx = 0
+			}
+			return
+		}
+		// Extract node names for fuzzy matching
+		nodeNames := make([]string, len(allNodes))
+		for i, node := range allNodes {
+			if node.entry != nil {
+				nodeNames[i] = node.entry.Name()
+			} else {
+				nodeNames[i] = ""
+			}
+		}
+		// Run fuzzy.Find to get matches
+		fuzzyMatches := fuzzy.Find(m.search, nodeNames)
+		if len(fuzzyMatches) == 0 {
+			m.displayed = 0
+			if m.treeIdx >= len(m.visibleNodes) {
+				m.treeIdx = 0
+			}
+			return
+		}
+		// Get matching nodes from fuzzy results
+		matchingNodes := make([]*treeNode, 0, len(fuzzyMatches))
+		for _, match := range fuzzyMatches {
+			if match.Index < len(allNodes) {
+				matchingNodes = append(matchingNodes, allNodes[match.Index])
+			}
+		}
+		// Build filtered tree showing only branches to matches
+		m.visibleNodes = buildFilteredTree(m.treeRoot, matchingNodes, m.modeHidden)
+		m.displayed = len(m.visibleNodes)
+		// Clamp cursor
+		if m.treeIdx >= len(m.visibleNodes) {
+			m.treeIdx = max(0, len(m.visibleNodes)-1)
+		}
+		return
+	}
+
+	// Search from parent of cursor position
+	// searchStartNode is already the parent (or root if at root level)
+	searchRoot := searchStartNode
+
+	// 1. Recursively load all descendants from search root
+	if searchRoot.entry != nil && searchRoot.entry.hasMode(entryModeDir) {
+		_ = searchRoot.loadAllDescendants() // Ignore errors for unreadable dirs
+	}
+	for _, child := range searchRoot.children {
 		if child.entry != nil && child.entry.hasMode(entryModeDir) {
 			_ = child.loadAllDescendants() // Ignore errors for unreadable dirs
 		}
 	}
 
-	// 2. Collect all nodes into flat list
+	// 2. Collect all nodes from search root into flat list
 	allNodes := make([]*treeNode, 0)
-	for _, child := range m.treeRoot.children {
-		descendants := child.collectAllDescendants(m.modeHidden)
+	if searchRoot == m.treeRoot {
+		// If searching from root, collect all root children's descendants
+		for _, child := range searchRoot.children {
+			descendants := child.collectAllDescendants(m.modeHidden)
+			allNodes = append(allNodes, descendants...)
+		}
+	} else {
+		// If searching from a subtree, collect that subtree
+		descendants := searchRoot.collectAllDescendants(m.modeHidden)
 		allNodes = append(allNodes, descendants...)
 	}
 
@@ -334,6 +413,59 @@ func (m *model) selectedTreeNode() *treeNode {
 		return m.visibleNodes[m.treeIdx]
 	}
 	return nil
+}
+
+// findDeepestMatch finds the node with the highest depth among visible nodes
+func (m *model) findDeepestMatch() *treeNode {
+	if len(m.visibleNodes) == 0 {
+		return nil
+	}
+	deepest := m.visibleNodes[0]
+	maxDepth := deepest.depth
+	for _, node := range m.visibleNodes {
+		if node.depth > maxDepth {
+			maxDepth = node.depth
+			deepest = node
+		}
+	}
+	return deepest
+}
+
+// findLeafNodes finds all leaf nodes (files or directories with no children) in visible nodes
+func (m *model) findLeafNodes() []*treeNode {
+	var leafNodes []*treeNode
+	for _, node := range m.visibleNodes {
+		if node.entry == nil {
+			continue // Skip virtual root
+		}
+		// A leaf node is either:
+		// 1. A file
+		// 2. A directory with no children
+		if node.entry.hasMode(entryModeFile) {
+			leafNodes = append(leafNodes, node)
+		} else if node.entry.hasMode(entryModeDir) {
+			// Check if directory has no children (or children are all hidden)
+			if len(node.children) == 0 {
+				leafNodes = append(leafNodes, node)
+			} else {
+				// Check if all children are hidden
+				hasVisibleChildren := false
+				for _, child := range node.children {
+					if child.entry == nil {
+						continue
+					}
+					if m.modeHidden || !child.entry.hasMode(entryModeHidden) {
+						hasVisibleChildren = true
+						break
+					}
+				}
+				if !hasVisibleChildren {
+					leafNodes = append(leafNodes, node)
+				}
+			}
+		}
+	}
+	return leafNodes
 }
 
 func min(i, j int) int {

@@ -110,9 +110,9 @@ func flags() string {
 		usageFlagLine("toggle off bottom status bar menu", flagNoStatusBar),
 		usageFlagLine("toggle off trailing annotators", flagNoTrailing),
 		"",
-		usageFlagLine("remap the escape key to the following value, using\nrepeated values to require multiple presses", flagRemapEsc),
+		usageFlagLine("start in tree view mode", flagTree, flagTreeShort),
 		"",
-		usageFlagLine("disable ClearScreen fix for tree expand\n(exposes Bubble Tea rendering bug)", flagNoClearScreenFix),
+		usageFlagLine("remap the escape key to the following value, using\nrepeated values to require multiple presses", flagRemapEsc),
 	}
 	return fmt.Sprintf(usage, strings.Join(flags, "\n"))
 }

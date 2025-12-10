@@ -156,10 +156,28 @@ func actionModeHelp(m *model, msg tea.KeyMsg, esc bool) actionResult {
 
 func actionModeSearch(m *model, msg tea.KeyMsg, esc bool) actionResult {
 	if esc || key.Matches(msg, keyEsc) {
-		// Exit search mode but keep the search filter active in normal mode.
+		// Exit search mode - in tree mode, restore cursor to currently selected node
 		m.modeSearch = false
 		if m.modeTree {
+			// Save the currently selected node's path before clearing search
+			selectedNode := m.selectedTreeNode()
+			var savedPath string
+			if selectedNode != nil {
+				savedPath = selectedNode.fullPath
+			}
+			m.treeSearchStartNode = nil
+			m.search = "" // Clear search to unfilter
 			m.rebuildVisibleNodes()
+			// Find and position cursor on the saved node
+			if savedPath != "" {
+				for i, node := range m.visibleNodes {
+					if node.fullPath == savedPath {
+						m.treeIdx = i
+						m.adjustScrollOffset()
+						break
+					}
+				}
+			}
 		}
 		return newActionResult(nil)
 	}
@@ -199,6 +217,47 @@ func actionModeSearch(m *model, msg tea.KeyMsg, esc bool) actionResult {
 		return newActionResult(nil)
 
 	case key.Matches(msg, keySelect):
+		// In tree mode, Enter returns all leaf nodes that match the search
+		if m.modeTree {
+			leafNodes := m.findLeafNodes()
+			if len(leafNodes) > 0 {
+				var paths []string
+				for _, node := range leafNodes {
+					if node.entry == nil {
+						continue
+					}
+					var path string
+					if node.entry.hasMode(entryModeSymlink) {
+						// Use parent directory for symlink resolution
+						parentPath := filepath.Dir(node.fullPath)
+						sl, err := followSymlink(parentPath, node.entry)
+						if err != nil {
+							// Skip symlinks that can't be resolved
+							continue
+						}
+						path = sanitize.SanitizeOutputPath(sl.absPath)
+					} else {
+						path = sanitize.SanitizeOutputPath(node.fullPath)
+					}
+					paths = append(paths, path)
+				}
+				if len(paths) > 0 {
+					// Output one path per line
+					m.setExit(strings.Join(paths, "\n"))
+					if m.modeSubshell {
+						fmt.Print(m.exitStr)
+					}
+					m.clearSearch()
+					return newActionResult(tea.Quit)
+				}
+			}
+			// No leaf nodes found, just exit search
+			m.modeSearch = false
+			m.treeSearchStartNode = nil
+			m.search = ""
+			m.rebuildVisibleNodes()
+			return newActionResult(nil)
+		}
 		_, cmd := m.searchSelectAction()
 		return newActionResult(cmd)
 
@@ -220,6 +279,15 @@ func actionModeSearch(m *model, msg tea.KeyMsg, esc bool) actionResult {
 		}
 		_, cmd := m.searchSelectAction()
 		return newActionResult(cmd)
+
+	case key.Matches(msg, keySearchSlash):
+		// "/" in search mode adds "/" to search string
+		// (On Unix, keyFileSeparator handles this, but this case handles it on other systems)
+		m.search += "/"
+		if m.modeTree {
+			m.rebuildVisibleNodes()
+		}
+		return newActionResult(nil)
 
 	default:
 		if msg.Type == tea.KeyRunes || key.Matches(msg, keySpace) {
@@ -250,10 +318,23 @@ func actionModeMarks(m *model, msg tea.KeyMsg, esc bool) actionResult {
 func actionModeTree(m *model, msg tea.KeyMsg, esc bool) actionResult {
 	switch {
 
-	case key.Matches(msg, keyModeSearch):
-		// Enter search mode
-		m.modeSearch = true
-		return newActionResult(nil)
+	case key.Matches(msg, keyModeSearch), key.Matches(msg, keySearchSlash):
+		// Enter search mode - save parent of current node as search start
+		// "/" also starts search in normal mode
+		if !m.modeSearch {
+			m.modeSearch = true
+			selectedNode := m.selectedTreeNode()
+			// Search from parent of selected node, or root if no parent
+			if selectedNode != nil && selectedNode.parent != nil {
+				m.treeSearchStartNode = selectedNode.parent
+			} else {
+				// No parent (at root level), use root
+				m.treeSearchStartNode = m.treeRoot
+			}
+			return newActionResult(nil)
+		}
+		// If already in search mode, "/" should be handled by search handler
+		return newActionResultNoop()
 
 	case key.Matches(msg, keyUp):
 		m.treeMoveUp()
@@ -301,7 +382,7 @@ func (m *model) treeSelectAction() actionResult {
 
 	m.saveCursor()
 
-	// For files: return path and quit (same as current behavior)
+	// For files: return path and quit
 	if node.entry.hasMode(entryModeFile) {
 		m.setExit(sanitize.SanitizeOutputPath(node.fullPath))
 		if m.modeSubshell {
@@ -310,17 +391,13 @@ func (m *model) treeSelectAction() actionResult {
 		return newActionResult(tea.Quit)
 	}
 
-	// For directories: descend (make this dir the new root)
+	// For directories: return path and quit (same as files)
 	if node.entry.hasMode(entryModeDir) {
-		m.setPath(node.fullPath)
-		if err := m.listTree(); err != nil {
-			m.restorePath()
-			m.setError(err, err.Error())
-		} else {
-			m.treeIdx = 0
-			m.scrollOffset = 0
+		m.setExit(sanitize.SanitizeOutputPath(node.fullPath))
+		if m.modeSubshell {
+			fmt.Print(m.exitStr)
 		}
-		return newActionResult(nil)
+		return newActionResult(tea.Quit)
 	}
 
 	// Handle symlinks
@@ -338,16 +415,12 @@ func (m *model) treeSelectAction() actionResult {
 			}
 			return newActionResult(tea.Quit)
 		}
-		// The symlink points to a directory.
-		m.setPath(sl.absPath)
-		if err := m.listTree(); err != nil {
-			m.restorePath()
-			m.setError(err, err.Error())
-		} else {
-			m.treeIdx = 0
-			m.scrollOffset = 0
+		// The symlink points to a directory: return path and quit
+		m.setExit(sanitize.SanitizeOutputPath(sl.absPath))
+		if m.modeSubshell {
+			fmt.Print(m.exitStr)
 		}
-		return newActionResult(nil)
+		return newActionResult(tea.Quit)
 	}
 
 	m.setError(
@@ -437,6 +510,11 @@ func actionModeGeneral(m *model, msg tea.KeyMsg, esc bool) actionResult {
 		return newActionResult(cmd)
 
 	case key.Matches(msg, keyBack):
+		// Backspace is a no-op in tree mode normal mode
+		if m.modeTree {
+			return newActionResultNoop()
+		}
+
 		m.saveCursor()
 
 		path, err := filepath.Abs(filepath.Join(m.path, ".."))
@@ -482,6 +560,7 @@ func actionModeGeneral(m *model, msg tea.KeyMsg, esc bool) actionResult {
 
 	case key.Matches(msg, keyModeHelp):
 		m.modeHelp = true
+		return newActionResult(tea.ClearScreen)
 
 	case key.Matches(msg, keyModeSearch):
 		m.modeSearch = true

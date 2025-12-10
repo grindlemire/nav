@@ -27,8 +27,9 @@ var (
 	keyLeft  = key.NewBinding(key.WithKeys("left", "h"))
 	keyRight = key.NewBinding(key.WithKeys("right", "l"))
 
-	keyModeHelp   = key.NewBinding(key.WithKeys("H"))
-	keyModeSearch = key.NewBinding(key.WithKeys("i"))
+	keyModeHelp    = key.NewBinding(key.WithKeys("H"))
+	keyModeSearch  = key.NewBinding(key.WithKeys("i"))
+	keySearchSlash = key.NewBinding(key.WithKeys("/"))
 
 	keyToggleFollowSymlink = key.NewBinding(key.WithKeys("f"))
 	keyToggleHidden        = key.NewBinding(key.WithKeys("a"))

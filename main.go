@@ -36,7 +36,8 @@ const (
 	flagNoStatusBar         = "--no-status-bar"
 	flagNoTrailing          = "--no-trailing"
 	flagRemapEsc            = "--remap-esc"
-	flagNoClearScreenFix    = "--no-clear-fix"
+	flagTree                = "--tree"
+	flagTreeShort           = "-t"
 )
 
 func main() {
@@ -52,9 +53,16 @@ func main() {
 	}
 
 	// Populate the model.
-	err = m.list()
-	if err != nil {
-		exit(err, m.exitCode)
+	if m.modeTree {
+		err = m.listTree()
+		if err != nil {
+			exit(err, m.exitCode)
+		}
+	} else {
+		err = m.list()
+		if err != nil {
+			exit(err, m.exitCode)
+		}
 	}
 
 	// Terminal coloring.
@@ -98,8 +106,8 @@ func parseArgs(args []string, m *model) error {
 			m.modeTrailing = false
 		case flagNoStatusBar:
 			m.hideStatusBar = true
-		case flagNoClearScreenFix:
-			m.noClearScreenFix = true
+		case flagTree, flagTreeShort:
+			m.modeTree = true
 		case flagRemapEsc:
 			if i > len(args)-2 {
 				return fmt.Errorf("%s must be followed by a string value", flagRemapEsc)

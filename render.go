@@ -15,6 +15,12 @@ var (
 	barRendererStatus   = lipgloss.NewStyle().Background(lipgloss.Color("#494949")).Foreground(lipgloss.Color("#FFFFFF"))
 	barRendererError    = lipgloss.NewStyle().Background(lipgloss.Color("#EB5B34")).Foreground(lipgloss.Color("#FFFFFF"))
 	barRendererOK       = lipgloss.NewStyle().Background(lipgloss.Color("#499F1C")).Foreground(lipgloss.Color("#FFFFFF"))
+
+	// Tree view breadcrumb styles
+	barRendererBreadcrumb          = lipgloss.NewStyle().Foreground(lipgloss.Color("#AAAAAA"))
+	barRendererBreadcrumbCurrent   = lipgloss.NewStyle().Bold(true).Background(lipgloss.Color("#499F1C")).Foreground(lipgloss.Color("#FFFFFF"))
+	barRendererBreadcrumbSeparator = lipgloss.NewStyle().Foreground(lipgloss.Color("#888888"))
+	barRendererScrollIndicator     = lipgloss.NewStyle().Foreground(lipgloss.Color("#666666")).Italic(true)
 )
 
 type cursorRenderer struct {

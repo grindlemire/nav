@@ -58,6 +58,26 @@ func (n *treeNode) loadChildren() error {
 	return nil
 }
 
+// isLastChild returns true if this node is the last visible child of its parent
+func (n *treeNode) isLastChild(modeHidden bool) bool {
+	if n.parent == nil {
+		return false // Root has no parent
+	}
+
+	// Find the last visible sibling
+	for i := len(n.parent.children) - 1; i >= 0; i-- {
+		sibling := n.parent.children[i]
+		if sibling.entry == nil {
+			continue
+		}
+		if !modeHidden && sibling.entry.hasMode(entryModeHidden) {
+			continue
+		}
+		return sibling == n
+	}
+	return false
+}
+
 // flatten returns visible nodes in DFS order (only expanded subtrees)
 func (n *treeNode) flatten(modeHidden bool) []*treeNode {
 	var nodes []*treeNode

@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"runtime"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/key"
@@ -10,21 +12,42 @@ import (
 
 func (m *model) treeView() string {
 	if len(m.visibleNodes) == 0 {
-		return m.locationBar() + "\n\n\t(no entries)\n"
+		return m.treeLocationBar() + "\n\n\t(no entries)\n"
 	}
 
-	viewHeight := m.height - 2
+	viewHeight := m.height - 3 // Account for location bar (1) and status bar (2)
 	displayNameOpts := m.displayNameOpts()
 
 	var output []string
-	output = append(output, m.locationBar())
+	output = append(output, m.treeLocationBar())
+
+	// Check if we'll need scroll indicators and account for their space
+	hasTopIndicator := m.scrollOffset > 0
+	if hasTopIndicator {
+		viewHeight-- // Reserve space for top indicator
+	}
+
+	// Check if we'll need bottom indicator (before accounting for it)
+	// We need to check if there will be content below after showing viewHeight items
+	willHaveBottomIndicator := m.scrollOffset+viewHeight < len(m.visibleNodes)
+	if willHaveBottomIndicator {
+		viewHeight-- // Reserve space for bottom indicator
+	}
+
+	// Add scroll indicator at top if scrolled down
+	if hasTopIndicator {
+		remaining := m.scrollOffset
+		indicator := barRendererScrollIndicator.Render(fmt.Sprintf(" ↑ %d more", remaining))
+		output = append(output, indicator)
+	}
 
 	// Render visible slice based on scroll offset
 	endIdx := min(m.scrollOffset+viewHeight, len(m.visibleNodes))
+	startIdx := m.scrollOffset
 
-	for i := m.scrollOffset; i < endIdx; i++ {
+	for i := startIdx; i < endIdx; i++ {
 		node := m.visibleNodes[i]
-		rawLine := m.renderTreeNode(node, displayNameOpts)
+		rawLine := m.renderTreeNode(node, i, displayNameOpts)
 
 		// Pad line to full terminal width to ensure consistent diff rendering
 		lineWidth := lipgloss.Width(rawLine)
@@ -51,21 +74,116 @@ func (m *model) treeView() string {
 		output = append(output, finalLine)
 	}
 
+	// Add scroll indicator at bottom if more content below
+	if willHaveBottomIndicator {
+		remaining := len(m.visibleNodes) - endIdx
+		indicator := barRendererScrollIndicator.Render(fmt.Sprintf(" ↓ %d more", remaining))
+		output = append(output, indicator)
+	}
+
 	// Pad output to fill viewport height (prevents ghost lines from previous renders)
 	emptyLine := strings.Repeat(" ", m.width)
-	for len(output) < m.height-1 { // -1 for status bar
+	for len(output) < m.height-2 { // -2 for 2-line status bar
 		output = append(output, cursorRendererNormal.Render(emptyLine))
 	}
 
 	return strings.Join(output, "\n")
 }
 
-func (m *model) renderTreeNode(node *treeNode, opts []displayNameOption) string {
-	indent := strings.Repeat("  ", node.depth) // 2-space per level
+func (m *model) renderTreeNode(node *treeNode, idx int, opts []displayNameOption) string {
+	if node.entry == nil {
+		// Virtual root - shouldn't happen in normal rendering
+		return ""
+	}
+
+	// Helper to check if there are more visible siblings at a given depth level
+	// In DFS order, if we see another node at depth d before going back up (depth < d),
+	// and they share the same parent at depth d-1, they're siblings
+	hasMoreSiblingsAtDepth := func(depth int) bool {
+		if depth == 0 {
+			// Root level - check if there are more root-level nodes
+			for i := idx + 1; i < len(m.visibleNodes); i++ {
+				if m.visibleNodes[i].depth == 0 {
+					return true
+				}
+			}
+			return false
+		}
+
+		// For non-root levels, find the parent at depth-1
+		parentAtDepthMinus1 := node
+		for parentAtDepthMinus1 != nil && parentAtDepthMinus1.depth >= depth {
+			parentAtDepthMinus1 = parentAtDepthMinus1.parent
+		}
+
+		// Look ahead for siblings (same parent at depth-1, same depth d)
+		for i := idx + 1; i < len(m.visibleNodes); i++ {
+			sibling := m.visibleNodes[i]
+			if sibling.depth < depth {
+				// Gone back up, no more siblings at this depth
+				break
+			}
+			if sibling.depth == depth {
+				// Found a node at same depth - check if it shares the same parent
+				siblingParent := sibling
+				for siblingParent != nil && siblingParent.depth >= depth {
+					siblingParent = siblingParent.parent
+				}
+				if siblingParent == parentAtDepthMinus1 {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	// Build tree line prefix for each depth level
+	var prefix strings.Builder
+	for d := 0; d < node.depth; d++ {
+		if hasMoreSiblingsAtDepth(d) {
+			prefix.WriteString("│ ")
+		} else {
+			prefix.WriteString("  ")
+		}
+	}
+
+	// Determine connector for this node - check if there are more siblings at same depth
+	hasMoreSiblings := false
+	if node.depth == 0 {
+		// Root level - check for more root nodes
+		for i := idx + 1; i < len(m.visibleNodes); i++ {
+			if m.visibleNodes[i].depth == 0 {
+				hasMoreSiblings = true
+				break
+			}
+		}
+	} else if node.parent != nil {
+		// Look ahead for siblings with same parent
+		for i := idx + 1; i < len(m.visibleNodes); i++ {
+			sibling := m.visibleNodes[i]
+			if sibling.depth < node.depth {
+				// Gone back up, no more siblings
+				break
+			}
+			if sibling.depth == node.depth && sibling.parent == node.parent {
+				hasMoreSiblings = true
+				break
+			}
+		}
+	}
+
+	var connector string
+	if node.depth > 0 {
+		if hasMoreSiblings {
+			connector = "├─"
+		} else {
+			connector = "└─"
+		}
+	}
 
 	// Expand/collapse indicator
 	var indicator string
-	if node.entry != nil && node.entry.hasMode(entryModeDir) {
+	if node.entry.hasMode(entryModeDir) {
 		if node.expanded {
 			indicator = "▼ "
 		} else {
@@ -75,13 +193,8 @@ func (m *model) renderTreeNode(node *treeNode, opts []displayNameOption) string 
 		indicator = "  " // align with dirs
 	}
 
-	if node.entry == nil {
-		// Virtual root - shouldn't happen in normal rendering
-		return ""
-	}
-
 	name := newDisplayName(node.entry, opts...)
-	return indent + indicator + name.String()
+	return prefix.String() + connector + indicator + name.String()
 }
 
 func (m *model) markedTreeNode(idx int) bool {
@@ -290,6 +403,88 @@ func (m *model) locationBar() string {
 		}
 	}
 	return locationBar
+}
+
+func (m *model) treeLocationBar() string {
+	// Error mode: show error bar instead of breadcrumb
+	if m.modeError {
+		err := fmt.Sprintf(
+			"\tERROR (\"%s\": dismiss): %s",
+			keyString(keyDismissError),
+			m.errorStr,
+		)
+		return barRendererError.Render(err + "\t\t")
+	}
+
+	// Get the selected node's full path for breadcrumb, fallback to m.path
+	path := m.path
+	if node := m.selectedTreeNode(); node != nil {
+		path = node.fullPath
+	}
+
+	// Only replace home dir with ~ if path is within home directory
+	if userHomeDir, err := os.UserHomeDir(); err == nil && strings.HasPrefix(path, userHomeDir) {
+		path = strings.Replace(path, userHomeDir, "~", 1)
+	}
+	if runtime.GOOS == "windows" {
+		path = strings.ReplaceAll(strings.Replace(path, "\\/", fileSeparator, 1), "/", fileSeparator)
+	}
+
+	// Split path into components
+	var components []string
+	if path == fileSeparator || path == "~" {
+		components = []string{path}
+	} else {
+		// Handle both absolute paths and paths starting with ~
+		if strings.HasPrefix(path, "~"+fileSeparator) {
+			components = append([]string{"~"}, strings.Split(strings.TrimPrefix(path, "~"+fileSeparator), fileSeparator)...)
+		} else if strings.HasPrefix(path, fileSeparator) {
+			components = strings.Split(strings.TrimPrefix(path, fileSeparator), fileSeparator)
+			// Prepend root separator for absolute paths
+			components = append([]string{fileSeparator}, components...)
+		} else {
+			components = strings.Split(path, fileSeparator)
+		}
+	}
+
+	// Filter out empty components
+	var cleanComponents []string
+	for _, comp := range components {
+		if comp != "" {
+			cleanComponents = append(cleanComponents, comp)
+		}
+	}
+	if len(cleanComponents) == 0 {
+		cleanComponents = []string{fileSeparator}
+	}
+
+	// Build breadcrumb string
+	var breadcrumbParts []string
+	for i, comp := range cleanComponents {
+		if i > 0 {
+			separator := barRendererBreadcrumbSeparator.Render("/")
+			breadcrumbParts = append(breadcrumbParts, separator)
+		}
+
+		// Last component (current directory) gets highlighted
+		if i == len(cleanComponents)-1 {
+			breadcrumbParts = append(breadcrumbParts, barRendererBreadcrumbCurrent.Render(comp))
+		} else {
+			breadcrumbParts = append(breadcrumbParts, barRendererBreadcrumb.Render(comp))
+		}
+	}
+
+	breadcrumb := strings.Join(breadcrumbParts, "")
+
+	// Append search term if in search mode
+	if m.modeSearch || m.search != "" {
+		if m.path != fileSeparator {
+			breadcrumb += barRendererSearch.Render("/" + m.search)
+		}
+	}
+
+	// Render with location bar background
+	return barRendererLocation.Render(breadcrumb)
 }
 
 func keyString(key key.Binding) string {
